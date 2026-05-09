@@ -1,249 +1,185 @@
+/**
+ * monitoringEngine.js
+ *
+ * Continuously probes proxy URLs on the configured cadence and:
+ *   1. Updates each proxy's state in the store.
+ *   2. Builds a failure snapshot.
+ *   3. Passes the snapshot to the alert manager.
+ *
+ * The engine is hot-reload safe: changing check_interval_seconds via POST /config
+ * restarts the timer immediately without restarting the process.
+ */
+ 
 const { checkProxy: defaultCheckProxy, PROXY_STATUS } = require('./proxyChecker.js');
-const store = require('../store/dataStore.js');
+const store        = require('../store/dataStore.js');
 const alertManager = require('./alertManager.js');
-
+ 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+ 
 const DEFAULT_CONFIG = Object.freeze({
   check_interval_seconds: 15,
-  request_timeout_ms: 3000,
+  request_timeout_ms:     3000,
 });
-
+ 
 function normalizeConfig(config = {}) {
-  const checkInterval = Number(config.check_interval_seconds);
-  const timeout = Number(config.request_timeout_ms);
-
+  const interval = Number(config.check_interval_seconds);
+  const timeout  = Number(config.request_timeout_ms);
   return {
-    check_interval_seconds:
-      Number.isFinite(checkInterval) && checkInterval > 0
-        ? checkInterval
-        : DEFAULT_CONFIG.check_interval_seconds,
-    request_timeout_ms:
-      Number.isFinite(timeout) && timeout > 0
-        ? timeout
-        : DEFAULT_CONFIG.request_timeout_ms,
+    check_interval_seconds: Number.isFinite(interval) && interval > 0 ? interval : DEFAULT_CONFIG.check_interval_seconds,
+    request_timeout_ms:     Number.isFinite(timeout)  && timeout  > 0 ? timeout  : DEFAULT_CONFIG.request_timeout_ms,
   };
 }
-
-async function maybeCall(target, names, ...args) {
-  for (const name of names) {
-    if (typeof target?.[name] === "function") {
-      return target[name](...args);
-    }
-  }
-  return undefined;
-}
-
-async function getConfig(store) {
-  const config = await maybeCall(store, ["getConfig", "readConfig"]);
+ 
+async function getConfig(storeRef) {
+  const config = typeof storeRef.getConfig === 'function' ? storeRef.getConfig() : {};
   return normalizeConfig(config);
 }
-
-async function getProxyList(store) {
-  const proxies = await maybeCall(store, [
-    "getAllProxies",
-    "listProxies",
-    "getProxies",
-  ]);
-
-  if (!proxies) {
-    return [];
-  }
-  if (proxies instanceof Map) {
-    return Array.from(proxies.values());
-  }
+ 
+async function getProxyList(storeRef) {
+  const fn      = storeRef.getAllProxies || storeRef.listProxies || storeRef.getProxies;
+  const proxies = typeof fn === 'function' ? fn.call(storeRef) : [];
+  if (proxies instanceof Map) return Array.from(proxies.values());
   return Array.isArray(proxies) ? proxies : [];
 }
-
+ 
 function buildHistoryEntry(result) {
-  const entry = {
-    checked_at: result.checked_at,
-    status: result.status,
-  };
-
-  if (Number.isFinite(result.response_time_ms)) {
-    entry.response_time_ms = result.response_time_ms;
-  }
-
+  const entry = { checked_at: result.checked_at, status: result.status };
+  if (Number.isFinite(result.response_time_ms)) entry.response_time_ms = result.response_time_ms;
   return entry;
 }
-
+ 
 function buildProxyUpdate(proxy, result) {
-  const previousTotalChecks = Number(proxy.total_checks) || 0;
-  const previousUpChecks = Number(proxy.up_checks) || 0;
-  const wasUp = result.status === PROXY_STATUS.UP;
-
+  const wasUp           = result.status === "up";
+  const prevTotal       = Number(proxy.total_checks)         || 0;
+  const prevUp          = Number(proxy.up_checks)            || 0;
+  const prevConsec      = Number(proxy.consecutive_failures) || 0;
+ 
   return {
-    status: result.status,
-    last_checked_at: result.checked_at,
-    consecutive_failures: wasUp
-      ? 0
-      : (Number(proxy.consecutive_failures) || 0) + 1,
-    total_checks: previousTotalChecks + 1,
-    up_checks: previousUpChecks + (wasUp ? 1 : 0),
-    historyEntry: buildHistoryEntry(result),
+    status:               result.status,
+    last_checked_at:      result.checked_at,
+    consecutive_failures: wasUp ? 0 : prevConsec + 1,
+    total_checks:         prevTotal + 1,
+    up_checks:            prevUp + (wasUp ? 1 : 0),
+    historyEntry:         buildHistoryEntry(result),
   };
 }
-
-function mutateProxy(proxy, update) {
-  proxy.status = update.status;
-  proxy.last_checked_at = update.last_checked_at;
-  proxy.consecutive_failures = update.consecutive_failures;
-  proxy.total_checks = update.total_checks;
-  proxy.up_checks = update.up_checks;
-
-  if (!Array.isArray(proxy.history)) {
-    proxy.history = [];
-  }
-  proxy.history.push(update.historyEntry);
-}
-
-async function recordProxyCheck(store, proxy, result) {
+ 
+async function recordCheck(storeRef, proxy, result) {
   const update = buildProxyUpdate(proxy, result);
-  const recorder = store?.recordProxyCheck || store?.updateProxyAfterCheck;
-
-  if (typeof recorder === "function") {
-    await recorder.call(store, proxy.id, update);
+ 
+  if (typeof storeRef.recordProxyCheck === 'function') {
+    storeRef.recordProxyCheck(proxy.id, update);
   } else {
-    mutateProxy(proxy, update);
+    // Fallback: mutate in place (for test stores that don't have recordProxyCheck)
+    proxy.status               = update.status;
+    proxy.last_checked_at      = update.last_checked_at;
+    proxy.consecutive_failures = update.consecutive_failures;
+    proxy.total_checks         = update.total_checks;
+    proxy.up_checks            = update.up_checks;
+    if (!Array.isArray(proxy.history)) proxy.history = [];
+    proxy.history.push(update.historyEntry);
+ 
+    // Try to increment global counter
+    if (typeof storeRef.incrementTotalChecks === 'function') {
+      storeRef.incrementTotalChecks(1);
+    }
   }
-
-  await maybeCall(store, ["incrementTotalChecks", "incrementCheckCount"], 1);
-  return update;
 }
-
-function buildFailureSnapshot(proxies) {
-  const total_proxies = proxies.length;
-  const failed_proxy_ids = proxies
-    .filter((proxy) => proxy.status === PROXY_STATUS.DOWN)
-    .map((proxy) => proxy.id);
-  const failed_proxies = failed_proxy_ids.length;
-
-  return {
-    failure_rate: total_proxies === 0 ? 0 : failed_proxies / total_proxies,
-    total_proxies,
-    failed_proxies,
-    failed_proxy_ids,
-  };
+ 
+function buildSnapshot(proxies) {
+  const total_proxies    = proxies.length;
+  const failed_proxy_ids = proxies.filter((p) => p.status === PROXY_STATUS.DOWN).map((p) => p.id);
+  const failed_proxies   = failed_proxy_ids.length;
+  const failure_rate     = total_proxies === 0 ? 0 : failed_proxies / total_proxies;
+ 
+  return { failure_rate, total_proxies, failed_proxies, failed_proxy_ids };
 }
-
-async function sendAlertSnapshot(alertManager, snapshot) {
-  await maybeCall(
-    alertManager,
-    [
-      "handleMonitoringSnapshot",
-      "evaluateMonitoringSnapshot",
-      "evaluatePoolHealth",
-      "evaluate",
-    ],
-    snapshot,
-  );
+ 
+async function sendSnapshot(alertMgr, snapshot) {
+  const fn =
+    alertMgr?.handleMonitoringSnapshot ||
+    alertMgr?.evaluateMonitoringSnapshot ||
+    alertMgr?.evaluatePoolHealth ||
+    alertMgr?.evaluate;
+ 
+  if (typeof fn === 'function') {
+    await fn.call(alertMgr, snapshot);
+  }
 }
-
-function probeFailureResult(error, now) {
-  return {
-    status: PROXY_STATUS.DOWN,
-    checked_at: now().toISOString(),
-    response_time_ms: 0,
-    error: error?.message || "probe_failure",
-  };
-}
-
+ 
+// ─── MonitoringEngine class ───────────────────────────────────────────────────
+ 
 class MonitoringEngine {
   constructor({
-    store,
-    alertManager,
-    checkProxy = defaultCheckProxy,
-    setIntervalFn = setInterval,
-    clearIntervalFn = clearInterval,
-    now = () => new Date(),
+    store:          storeRef,
+    alertManager:   alertMgr,
+    checkProxy:     checkProxyFn = defaultCheckProxy,
+    setIntervalFn:  setInt       = setInterval,
+    clearIntervalFn: clearInt    = clearInterval,
+    now:            nowFn        = () => new Date(),
   } = {}) {
-    if (!store) {
-      throw new TypeError("MonitoringEngine requires a store");
-    }
-
-    this.store = store;
-    this.alertManager = alertManager;
-    this.checkProxy = checkProxy;
-    this.setIntervalFn = setIntervalFn;
-    this.clearIntervalFn = clearIntervalFn;
-    this.now = now;
-    this.timer = null;
+    if (!storeRef) throw new TypeError('MonitoringEngine requires a store');
+ 
+    this.store          = storeRef;
+    this.alertManager   = alertMgr;
+    this.checkProxy     = checkProxyFn;
+    this.setIntervalFn  = setInt;
+    this.clearIntervalFn = clearInt;
+    this.now            = nowFn;
+    this.timer          = null;
     this.cycleInProgress = false;
   }
-
-  get isRunning() {
-    return this.timer !== null;
-  }
-
+ 
+  get isRunning() { return this.timer !== null; }
+ 
   async start({ runImmediately = true } = {}) {
-    if (this.isRunning) {
-      return;
-    }
-
-    const config = await getConfig(this.store);
+    if (this.isRunning) return;
+ 
+    const config     = await getConfig(this.store);
     const intervalMs = config.check_interval_seconds * 1000;
-
-    this.timer = this.setIntervalFn(() => {
-      void this.runCycle();
-    }, intervalMs);
-
-    if (typeof this.timer?.unref === "function") {
-      this.timer.unref();
-    }
-
-    if (runImmediately) {
-      await this.runCycle();
-    }
+ 
+    this.timer = this.setIntervalFn(() => { void this.runCycle(); }, intervalMs);
+    if (typeof this.timer?.unref === 'function') this.timer.unref();
+ 
+    if (runImmediately) await this.runCycle();
   }
-
+ 
   stop() {
-    if (!this.isRunning) {
-      return;
-    }
-
+    if (!this.isRunning) return;
     this.clearIntervalFn(this.timer);
     this.timer = null;
   }
-
+ 
   async restart({ runImmediately = false } = {}) {
     this.stop();
     await this.start({ runImmediately });
   }
-
+ 
   async onConfigUpdated() {
-    if (this.isRunning) {
-      await this.restart({ runImmediately: false });
-    }
+    if (this.isRunning) await this.restart({ runImmediately: false });
   }
-
+ 
   async onPoolChanged() {
     const proxies = await getProxyList(this.store);
-    if (proxies.length === 0) {
-      this.stop();
-      return;
-    }
-
-    if (!this.isRunning) {
-      await this.start({ runImmediately: true });
-    }
+    if (proxies.length === 0) { this.stop(); return; }
+    if (!this.isRunning) await this.start({ runImmediately: true });
   }
-
+ 
   async runCycle() {
-    if (this.cycleInProgress) {
-      return null;
-    }
-
+    if (this.cycleInProgress) return null;
     this.cycleInProgress = true;
-
+ 
     try {
-      const config = await getConfig(this.store);
+      const config  = await getConfig(this.store);
       const proxies = await getProxyList(this.store);
-
+ 
       if (proxies.length === 0) {
-        const snapshot = buildFailureSnapshot([]);
-        await sendAlertSnapshot(this.alertManager, snapshot);
+        const snapshot = buildSnapshot([]);
+        await sendSnapshot(this.alertManager, snapshot);
         return snapshot;
       }
-
+ 
+      // Probe all proxies concurrently
       await Promise.allSettled(
         proxies.map(async (proxy) => {
           let result;
@@ -252,36 +188,44 @@ class MonitoringEngine {
               request_timeout_ms: config.request_timeout_ms,
               now: this.now,
             });
-          } catch (error) {
-            result = probeFailureResult(error, this.now);
+          } catch (err) {
+            result = {
+              status:           "down",
+              checked_at:       this.now().toISOString(),
+              response_time_ms: config.request_timeout_ms,
+              error:            err?.message || 'probe_failure',
+            };
           }
-
-          await recordProxyCheck(this.store, proxy, result);
+          await recordCheck(this.store, proxy, result);
         }),
       );
-
+ 
+      // Re-read proxies from store so snapshot reflects all updates
       const updatedProxies = await getProxyList(this.store);
-      const snapshot = buildFailureSnapshot(updatedProxies);
-      await sendAlertSnapshot(this.alertManager, snapshot);
+      const snapshot       = buildSnapshot(updatedProxies);
+ 
+      // Pass snapshot to alert manager — this is the authoritative failure rate
+      await sendSnapshot(this.alertManager, snapshot);
+ 
       return snapshot;
     } finally {
       this.cycleInProgress = false;
     }
   }
 }
-
-function createMonitoringEngine(options) {
-  return new MonitoringEngine(options);
-}
-
+ 
+// ─── Default singleton (used by routes) ──────────────────────────────────────
+ 
 const defaultMonitor = new MonitoringEngine({ store, alertManager });
-
+ 
 module.exports = {
-  start: (opts) => defaultMonitor.start(opts),
-  stop: () => defaultMonitor.stop(),
-  restart: (opts) => defaultMonitor.restart(opts),
-  getStatus: () => defaultMonitor.isRunning,
-  runCycle: () => defaultMonitor.runCycle(),
+  start:    (opts) => defaultMonitor.start(opts),
+  stop:     ()     => defaultMonitor.stop(),
+  restart:  (opts) => defaultMonitor.restart(opts),
+  getStatus: ()    => defaultMonitor.isRunning,
+  runCycle: ()     => defaultMonitor.runCycle(),
+ 
+  // Exported for test injection
   MonitoringEngine,
-  createMonitoringEngine
+  createMonitoringEngine: (opts) => new MonitoringEngine(opts),
 };
