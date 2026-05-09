@@ -15,7 +15,7 @@ router.post('/webhooks', (req, res) => {
   }
 
   const webhook = store.addWebhook(url);
-  res.json(webhook);
+  res.status(201).json(webhook);
 });
 
 module.exports = router;

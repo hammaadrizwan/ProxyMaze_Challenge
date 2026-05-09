@@ -91,53 +91,6 @@ function clearProxies() {
   return count;
 }
 
-function updateProxyAfterCheck(id, isUp, responseTimeMs) {
-  const proxy = state.proxies.get(id);
-  if (!proxy) return null;
-
-  const checkedAt = nowISO();
-  const status = isUp ? 'up' : 'down';
-
-  proxy.status = status;
-  proxy.last_checked_at = checkedAt;
-  proxy.total_checks += 1;
-  if (isUp) {
-    proxy.up_checks += 1;
-    proxy.consecutive_failures = 0;
-  } else {
-    proxy.consecutive_failures += 1;
-  }
-
-  proxy.history.unshift({
-    checked_at: checkedAt,
-    status,
-    response_time_ms: responseTimeMs,
-  });
-
-  state.metrics.total_checks += 1;
-  return proxy;
-}
-
-function recordProxyCheck(id, update) {
-  const proxy = state.proxies.get(id);
-  if (!proxy) return null;
-
-  proxy.status = update.status;
-  proxy.last_checked_at = update.last_checked_at;
-  proxy.consecutive_failures = update.consecutive_failures;
-  proxy.total_checks = update.total_checks;
-  proxy.up_checks = update.up_checks;
-  
-  if (!Array.isArray(proxy.history)) {
-    proxy.history = [];
-  }
-  // add to beginning of array for latest first like before
-  proxy.history.unshift(update.historyEntry);
-
-  state.metrics.total_checks += 1;
-  return proxy;
-}
-
 function recordProxyCheck(id, update) {
   const proxy = state.proxies.get(id);
   if (!proxy) return null;
@@ -278,7 +231,6 @@ module.exports = {
   getProxy,
   getAllProxies,
   clearProxies,
-  updateProxyAfterCheck,
   recordProxyCheck,
   getProxyPoolSummary,
   getFailedProxyIds,

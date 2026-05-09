@@ -181,4 +181,8 @@ function buildDiscordPayload(event, alert, intg) {
   };
 }
 
-module.exports = { dispatch };
+function reset() {
+  delivered.clear();
+}
+
+module.exports = { dispatch, reset };
