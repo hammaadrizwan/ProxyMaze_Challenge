@@ -29,6 +29,14 @@ app.use(webhookRoutes);
 app.use(integrationRoutes);
 app.use(metricRoutes);
 
+// ─── Root endpoint ───
+app.get('/', (req, res) => {
+  res.json({
+    message: "Welcome to ProxyMaze API",
+    status: "running"
+  });
+});
+
 // ─── 404 catch-all ───
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
