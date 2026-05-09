@@ -1,165 +1,296 @@
-export const dataStore = {
-    config: {
-        check_interval_seconds: 15,
-        request_timeout_ms: 3000
-    },
+/**
+ * dataStore.js
+ * Central in-memory state for the entire ProxyMaze system.
+ * All reads/writes go through exported helper functions to keep
+ * mutation logic contained in one place.
+ */
 
-    proxies: new Map(),
+const { nowISO } = require('../utils/timestamps');
+const { v4: uuidv4 } = require('uuid');
 
-    alerts: [],
+// State
 
-    webhooks: [],
+const state = {
+  config: {
+    check_interval_seconds: 30,
+    request_timeout_ms: 5000,
+  },
 
-    integrations: [],
+  /** @type {Map<string, object>} proxyId → proxy object */
+  proxies: new Map(),
 
-    metrics: {
-        total_checks: 0,
-        webhook_deliveries: 0
-    }
+  /** @type {Array<object>} ordered list of alerts */
+  alerts: [],
+
+  /** @type {Array<object>} registered webhook receivers */
+  webhooks: [],
+
+  /** @type {Array<object>} registered Slack / Discord integrations */
+  integrations: [],
+
+  /** Operational counters */
+  metrics: {
+    total_checks: 0,
+    webhook_deliveries: 0,
+  },
+
+  /** Alert counter for sequential IDs */
+  _alertCounter: 0,
+
+  /** Webhook counter */
+  _webhookCounter: 0,
+
+  /** Integration counter */
+  _integrationCounter: 0,
 };
 
-/*
-|--------------------------------------------------------------------------
-| Config Methods
-|--------------------------------------------------------------------------
-*/
+// Config
 
-export function getConfig() {
-    return dataStore.config;
+function getConfig() {
+  return { ...state.config };
 }
 
-export function updateConfig(config) {
-    dataStore.config = {
-        ...dataStore.config,
-        ...config
-    };
-
-    return dataStore.config;
+function setConfig(patch) {
+  if (patch.check_interval_seconds !== undefined) {
+    state.config.check_interval_seconds = patch.check_interval_seconds;
+  }
+  if (patch.request_timeout_ms !== undefined) {
+    state.config.request_timeout_ms = patch.request_timeout_ms;
+  }
+  return { ...state.config };
 }
 
-/*
-|--------------------------------------------------------------------------
-| Proxy Methods
-|--------------------------------------------------------------------------
-*/
+// Proxies
 
-export function addProxy(proxy) {
-    dataStore.proxies.set(proxy.id, proxy);
+function addProxy(id, url) {
+  const proxy = {
+    id,
+    url,
+    status: 'pending',
+    last_checked_at: null,
+    consecutive_failures: 0,
+    total_checks: 0,
+    up_checks: 0,
+    history: [],
+  };
+  state.proxies.set(id, proxy);
+  return proxy;
 }
 
-export function getProxy(id) {
-    return dataStore.proxies.get(id);
+function getProxy(id) {
+  return state.proxies.get(id) || null;
 }
 
-export function getAllProxies() {
-    return Array.from(dataStore.proxies.values());
+function getAllProxies() {
+  return Array.from(state.proxies.values());
 }
 
-export function clearProxies() {
-    dataStore.proxies.clear();
+function clearProxies() {
+  const count = state.proxies.size;
+  state.proxies.clear();
+  return count;
 }
 
-export function updateProxy(id, updates) {
-    const proxy = dataStore.proxies.get(id);
+function updateProxyAfterCheck(id, isUp, responseTimeMs) {
+  const proxy = state.proxies.get(id);
+  if (!proxy) return null;
 
-    if (!proxy) {
-        return null;
-    }
+  const checkedAt = nowISO();
+  const status = isUp ? 'up' : 'down';
 
-    const updatedProxy = {
-        ...proxy,
-        ...updates
-    };
+  proxy.status = status;
+  proxy.last_checked_at = checkedAt;
+  proxy.total_checks += 1;
+  if (isUp) {
+    proxy.up_checks += 1;
+    proxy.consecutive_failures = 0;
+  } else {
+    proxy.consecutive_failures += 1;
+  }
 
-    dataStore.proxies.set(id, updatedProxy);
+  proxy.history.unshift({
+    checked_at: checkedAt,
+    status,
+    response_time_ms: responseTimeMs,
+  });
 
-    return updatedProxy;
+  state.metrics.total_checks += 1;
+  return proxy;
 }
 
-export function recordProxyCheck(id, update) {
-    return updateProxy(id, {
-        status: update.status,
-        last_checked_at: update.last_checked_at,
-        consecutive_failures: update.consecutive_failures,
-        total_checks: update.total_checks,
-        up_checks: update.up_checks,
-        history: [
-            ...(getProxy(id)?.history || []),
-            update.historyEntry
-        ]
-    });
+function recordProxyCheck(id, update) {
+  const proxy = state.proxies.get(id);
+  if (!proxy) return null;
+
+  proxy.status = update.status;
+  proxy.last_checked_at = update.last_checked_at;
+  proxy.consecutive_failures = update.consecutive_failures;
+  proxy.total_checks = update.total_checks;
+  proxy.up_checks = update.up_checks;
+  
+  if (!Array.isArray(proxy.history)) {
+    proxy.history = [];
+  }
+  // add to beginning of array for latest first like before
+  proxy.history.unshift(update.historyEntry);
+
+  state.metrics.total_checks += 1;
+  return proxy;
 }
 
-/*
-|--------------------------------------------------------------------------
-| Alert Methods
-|--------------------------------------------------------------------------
-*/
+function recordProxyCheck(id, update) {
+  const proxy = state.proxies.get(id);
+  if (!proxy) return null;
 
-export function addAlert(alert) {
-    dataStore.alerts.push(alert);
+  proxy.status = update.status;
+  proxy.last_checked_at = update.last_checked_at;
+  proxy.consecutive_failures = update.consecutive_failures;
+  proxy.total_checks = update.total_checks;
+  proxy.up_checks = update.up_checks;
+  
+  if (!Array.isArray(proxy.history)) {
+    proxy.history = [];
+  }
+  // add to beginning of array for latest first like before
+  proxy.history.unshift(update.historyEntry);
+
+  state.metrics.total_checks += 1;
+  return proxy;
 }
 
-export function getAlerts() {
-    return dataStore.alerts;
+function getProxyPoolSummary() {
+  const all = getAllProxies();
+  const total = all.length;
+  const up = all.filter((p) => p.status === 'up').length;
+  const down = all.filter((p) => p.status === 'down').length;
+  const failure_rate = total === 0 ? 0 : parseFloat((down / total).toFixed(10));
+
+  return { total, up, down, failure_rate };
 }
 
-export function getActiveAlert() {
-    return dataStore.alerts.find(
-        (alert) => alert.status === "active"
-    );
+function getFailedProxyIds() {
+  return getAllProxies()
+    .filter((p) => p.status === 'down')
+    .map((p) => p.id);
 }
 
-/*
-|--------------------------------------------------------------------------
-| Webhook Methods
-|--------------------------------------------------------------------------
-*/
+// Alerts
 
-export function addWebhook(webhook) {
-    dataStore.webhooks.push(webhook);
+function getActiveAlert() {
+  return state.alerts.find((a) => a.status === 'active') || null;
 }
 
-export function getWebhooks() {
-    return dataStore.webhooks;
+function createAlert(failureRate, totalProxies, failedProxies, failedProxyIds) {
+  state._alertCounter += 1;
+  const alert = {
+    alert_id: `alert-${String(state._alertCounter).padStart(3, '0')}`,
+    status: 'active',
+    failure_rate: failureRate,
+    total_proxies: totalProxies,
+    failed_proxies: failedProxies,
+    failed_proxy_ids: [...failedProxyIds],
+    threshold: 0.20,
+    fired_at: nowISO(),
+    resolved_at: null,
+    message: `ALERT: Proxy failure rate ${failureRate.toFixed(2)} exceeds threshold 0.20`,
+  };
+  state.alerts.push(alert);
+  return alert;
 }
 
-/*
-|--------------------------------------------------------------------------
-| Integration Methods
-|--------------------------------------------------------------------------
-*/
-
-export function addIntegration(integration) {
-    dataStore.integrations.push(integration);
+function resolveAlert(alertId) {
+  const alert = state.alerts.find((a) => a.alert_id === alertId);
+  if (!alert) return null;
+  alert.status = 'resolved';
+  alert.resolved_at = nowISO();
+  alert.message = 'Alert resolved: failure rate recovered to below threshold';
+  return alert;
 }
 
-export function getIntegrations() {
-    return dataStore.integrations;
+function getAllAlerts() {
+  return [...state.alerts];
 }
 
-/*
-|--------------------------------------------------------------------------
-| Metrics Methods
-|--------------------------------------------------------------------------
-*/
+// Webhooks
 
-export function incrementTotalChecks() {
-    dataStore.metrics.total_checks += 1;
+function addWebhook(url) {
+  state._webhookCounter += 1;
+  const wh = {
+    id: `wh-${String(state._webhookCounter).padStart(3, '0')}`,
+    url,
+    registered_at: nowISO(),
+  };
+  state.webhooks.push(wh);
+  return wh;
 }
 
-export function incrementWebhookDeliveries() {
-    dataStore.metrics.webhook_deliveries += 1;
+function getWebhooks() {
+  return [...state.webhooks];
 }
 
-export function getMetrics() {
-    return {
-        total_checks: dataStore.metrics.total_checks,
-        current_pool_size: dataStore.proxies.size,
-        active_alerts: dataStore.alerts.filter(
-            (alert) => alert.status === "active"
-        ).length,
-        total_alerts: dataStore.alerts.length,
-        webhook_deliveries: dataStore.metrics.webhook_deliveries
-    };
+// Integrations
+
+function addIntegration(type, webhookUrl, username, events) {
+  state._integrationCounter += 1;
+  const integration = {
+    id: `int-${String(state._integrationCounter).padStart(3, '0')}`,
+    type,
+    webhook_url: webhookUrl,
+    username: username || 'ProxyWatch',
+    events: events || ['alert.fired', 'alert.resolved'],
+    registered_at: nowISO(),
+  };
+  state.integrations.push(integration);
+  return integration;
 }
+
+function getIntegrations() {
+  return [...state.integrations];
+}
+
+// Metrics
+
+function incrementWebhookDeliveries() {
+  state.metrics.webhook_deliveries += 1;
+}
+
+function getMetrics() {
+  const activeAlerts = state.alerts.filter((a) => a.status === 'active').length;
+  return {
+    total_checks: state.metrics.total_checks,
+    current_pool_size: state.proxies.size,
+    active_alerts: activeAlerts,
+    total_alerts: state.alerts.length,
+    webhook_deliveries: state.metrics.webhook_deliveries,
+  };
+}
+
+// Exports
+
+module.exports = {
+  // Config
+  getConfig,
+  setConfig,
+  // Proxies
+  addProxy,
+  getProxy,
+  getAllProxies,
+  clearProxies,
+  updateProxyAfterCheck,
+  getProxyPoolSummary,
+  getFailedProxyIds,
+  // Alerts
+  getActiveAlert,
+  createAlert,
+  resolveAlert,
+  getAllAlerts,
+  // Webhooks
+  addWebhook,
+  getWebhooks,
+  // Integrations
+  addIntegration,
+  getIntegrations,
+  // Metrics
+  incrementWebhookDeliveries,
+  getMetrics,
+};

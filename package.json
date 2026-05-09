@@ -2,11 +2,18 @@
   "name": "proxymaze-challenge",
   "version": "0.1.0",
   "description": "ProxyMaze'26 real-time proxy intelligence challenge implementation.",
-  "type": "module",
+  "main": "src/server.js",
   "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
     "test": "node tests/run-tests.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.16.0",
+    "express": "^5.2.1",
+    "uuid": "^14.0.0"
   }
 }

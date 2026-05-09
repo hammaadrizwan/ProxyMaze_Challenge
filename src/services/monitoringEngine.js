@@ -1,4 +1,6 @@
-import { checkProxy as defaultCheckProxy, PROXY_STATUS } from "./proxyChecker.js";
+const { checkProxy: defaultCheckProxy, PROXY_STATUS } = require('./proxyChecker.js');
+const store = require('../store/dataStore.js');
+const alertManager = require('./alertManager.js');
 
 const DEFAULT_CONFIG = Object.freeze({
   check_interval_seconds: 15,
@@ -145,7 +147,7 @@ function probeFailureResult(error, now) {
   };
 }
 
-export class MonitoringEngine {
+class MonitoringEngine {
   constructor({
     store,
     alertManager,
@@ -268,8 +270,18 @@ export class MonitoringEngine {
   }
 }
 
-export function createMonitoringEngine(options) {
+function createMonitoringEngine(options) {
   return new MonitoringEngine(options);
 }
 
-export default MonitoringEngine;
+const defaultMonitor = new MonitoringEngine({ store, alertManager });
+
+module.exports = {
+  start: (opts) => defaultMonitor.start(opts),
+  stop: () => defaultMonitor.stop(),
+  restart: (opts) => defaultMonitor.restart(opts),
+  getStatus: () => defaultMonitor.isRunning,
+  runCycle: () => defaultMonitor.runCycle(),
+  MonitoringEngine,
+  createMonitoringEngine
+};
