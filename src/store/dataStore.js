@@ -105,7 +105,7 @@ function recordProxyCheck(id, update) {
     proxy.history = [];
   }
   // add to beginning of array for latest first like before
-  proxy.history.unshift(update.historyEntry);
+  proxy.history.push(update.historyEntry);
 
   state.metrics.total_checks += 1;
   return proxy;
@@ -145,7 +145,7 @@ function createAlert(failureRate, totalProxies, failedProxies, failedProxyIds) {
     threshold: 0.20,
     fired_at: nowISO(),
     resolved_at: null,
-    message: `ALERT: Proxy failure rate ${failureRate.toFixed(2)} exceeds threshold 0.20`,
+    message: 'Proxy pool failure rate exceeded threshold',
   };
   state.alerts.push(alert);
   return alert;
@@ -156,7 +156,6 @@ function resolveAlert(alertId) {
   if (!alert) return null;
   alert.status = 'resolved';
   alert.resolved_at = nowISO();
-  alert.message = 'Alert resolved: failure rate recovered to below threshold';
   return alert;
 }
 

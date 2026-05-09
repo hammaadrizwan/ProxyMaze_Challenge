@@ -14,26 +14,33 @@ const notifications = require('./notificationEngine');
 
 const THRESHOLD = 0.20;
 
-/**
- * Called after every monitoring cycle with the fresh failure rate.
- * Decides whether to fire, update, or resolve alerts.
- */
-async function evaluate() {
-  const { total, down, failure_rate } = store.getProxyPoolSummary();
-  const failedIds = store.getFailedProxyIds();
+async function evaluate(snapshot) {
+  // Use the snapshot passed by the monitoring engine
+  // Fall back to store if no snapshot provided (backward compat)
+  let failure_rate, total, down, failedIds;
+  
+  if (snapshot && snapshot.failure_rate !== undefined) {
+    failure_rate = snapshot.failure_rate;
+    total = snapshot.total_proxies;
+    down = snapshot.failed_proxies;
+    failedIds = snapshot.failed_proxy_ids;
+  } else {
+    const summary = store.getProxyPoolSummary();
+    failure_rate = summary.failure_rate;
+    total = summary.total;
+    down = summary.down;
+    failedIds = store.getFailedProxyIds();
+  }
+
   const activeAlert = store.getActiveAlert();
 
   if (failure_rate >= THRESHOLD) {
-    // ── Breach ──
     if (!activeAlert) {
-      // No active alert → fire one
       const alert = store.createAlert(failure_rate, total, down, failedIds);
       console.log(`[AlertManager] 🚨 FIRED ${alert.alert_id} | rate=${failure_rate.toFixed(2)}`);
       await notifications.dispatch('alert.fired', alert);
     }
-    // Active alert already exists → do nothing (no duplicates)
   } else {
-    // ── Below threshold ──
     if (activeAlert) {
       const resolved = store.resolveAlert(activeAlert.alert_id);
       console.log(`[AlertManager] ✅ RESOLVED ${resolved.alert_id} | rate=${failure_rate.toFixed(2)}`);

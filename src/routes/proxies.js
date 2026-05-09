@@ -17,7 +17,7 @@ router.post('/proxies', (req, res) => {
     return res.status(400).json({ error: 'proxies must be an array of URLs' });
   }
 
-  if (replace) {
+  if (replace === true) {
     if (monitor.getStatus()) monitor.stop();
     store.clearProxies();
   }
@@ -29,7 +29,8 @@ router.post('/proxies', (req, res) => {
     added.push({ id: proxy.id, url: proxy.url, status: proxy.status });
   }
 
-  if (!monitor.getStatus()) {
+  // Always start monitoring if not running and pool is non-empty
+  if (!monitor.getStatus() && store.getAllProxies().length > 0) {
     monitor.start().catch((err) => {
       console.error('[Monitor] Failed to start:', err);
     });

@@ -13,12 +13,12 @@ router.get('/config', (req, res) => {
 });
 
 // POST /config — update monitoring configuration
-router.post('/config', (req, res) => {
+router.post('/config', async (req, res) => {
   const updated = store.setConfig(req.body);
 
   // If monitoring is active, restart with new interval
   if (monitor.getStatus()) {
-    monitor.restart();
+    await monitor.restart();
   }
 
   res.json(updated);

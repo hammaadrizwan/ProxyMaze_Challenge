@@ -18,8 +18,8 @@ function deliveryKey(url, alertId, event) {
 /**
  * POST with retry on 5xx. Max 3 retries, 2s apart.
  */
-async function postWithRetry(url, payload, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
+async function postWithRetry(url, payload, maxAttempts = 10) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const res = await axios.post(url, payload, {
         timeout: 10000,
@@ -29,18 +29,14 @@ async function postWithRetry(url, payload, retries = 3) {
       if (res.status >= 200 && res.status < 300) {
         return { success: true, status: res.status };
       }
-      // Retry only on 500, 502, 503, 504
-      if ([500, 502, 503, 504].includes(res.status) && attempt < retries) {
-        await sleep(2000);
+      if ([500, 502, 503, 504].includes(res.status)) {
+        await sleep(2000 * Math.min(attempt + 1, 5)); // backoff
         continue;
       }
+      // Non-retryable failure (4xx etc)
       return { success: false, status: res.status };
     } catch (err) {
-      if (attempt < retries) {
-        await sleep(2000);
-        continue;
-      }
-      return { success: false, status: 0 };
+      await sleep(2000 * Math.min(attempt + 1, 5));
     }
   }
   return { success: false, status: 0 };
@@ -131,19 +127,23 @@ async function dispatch(event, alert) {
 function buildSlackPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
   const color = isFired ? '#FF0000' : '#36a64f';
+  const text = isFired
+    ? `🚨 Alert fired: ${alert.message}`
+    : `✅ Alert resolved: ${alert.alert_id}`;
+
   return {
     username: intg.username || 'ProxyWatch',
-    text: alert.message,
+    text,
     attachments: [
       {
         color,
         fields: [
           { title: 'Alert ID', value: alert.alert_id, short: true },
-          { title: 'Threshold', value: String(alert.threshold), short: true },
-          { title: 'Failure Rate', value: String(alert.failure_rate), short: true },
-          { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`, short: true },
-          { title: 'Fired At', value: alert.fired_at, short: true },
-          { title: 'Failed IDs', value: alert.failed_proxy_ids.join(', ') || 'None', short: false },
+          { title: 'Threshold', value: String(alert.threshold ?? 0.2), short: true },
+          { title: 'Failure Rate', value: String(alert.failure_rate ?? 0), short: true },
+          { title: 'Failed Proxies', value: `${alert.failed_proxies ?? 0} / ${alert.total_proxies ?? 0}`, short: true },
+          { title: 'Fired At', value: alert.fired_at ?? '', short: true },
+          { title: 'Failed IDs', value: (alert.failed_proxy_ids ?? []).join(', ') || 'None', short: false },
         ],
         footer: 'ProxyMaze Alert System',
         ts: toUnixSeconds(alert.fired_at),
