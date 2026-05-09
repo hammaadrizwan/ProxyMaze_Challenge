@@ -1,0 +1,12 @@
+{
+  "name": "proxymaze-challenge",
+  "version": "0.1.0",
+  "description": "ProxyMaze'26 real-time proxy intelligence challenge implementation.",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
