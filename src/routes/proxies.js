@@ -17,12 +17,8 @@ router.post('/proxies', (req, res) => {
     return res.status(400).json({ error: 'proxies must be an array of URLs' });
   }
 
-  // Stop monitoring before modifying pool
-  if (monitor.getStatus()) {
-    monitor.stop();
-  }
-
   if (replace) {
+    if (monitor.getStatus()) monitor.stop();
     store.clearProxies();
   }
 
@@ -33,10 +29,13 @@ router.post('/proxies', (req, res) => {
     added.push({ id: proxy.id, url: proxy.url, status: proxy.status });
   }
 
-  // Start monitoring automatically
-  monitor.start();
+  if (!monitor.getStatus()) {
+    monitor.start().catch((err) => {
+      console.error('[Monitor] Failed to start:', err);
+    });
+  }
 
-  res.status(201).json({ total: added.length, proxies: added });
+  res.status(201).json({ accepted: added.length, proxies: added });
 });
 
 // GET /proxies — pool summary
@@ -97,8 +96,8 @@ router.delete('/proxies', (req, res) => {
   if (monitor.getStatus()) {
     monitor.stop();
   }
-  const cleared = store.clearProxies();
-  res.json({ message: 'Proxy pool cleared', cleared });
+  store.clearProxies();
+  res.status(204).send();
 });
 
 module.exports = router;

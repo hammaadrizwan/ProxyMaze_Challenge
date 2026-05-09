@@ -169,7 +169,7 @@ function getAllAlerts() {
 function addWebhook(url) {
   state._webhookCounter += 1;
   const wh = {
-    id: `wh-${String(state._webhookCounter).padStart(3, '0')}`,
+    webhook_id: `wh-${String(state._webhookCounter).padStart(3, '0')}`,
     url,
     registered_at: nowISO(),
   };
