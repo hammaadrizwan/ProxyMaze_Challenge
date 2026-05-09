@@ -1,6 +1,6 @@
 const DEFAULT_TIMEOUT_MS = 3000;
 
-export const PROXY_STATUS = Object.freeze({
+const PROXY_STATUS = Object.freeze({
   UP: "up",
   DOWN: "down",
 });
@@ -36,7 +36,7 @@ function errorReason(error) {
   return "connection_failure";
 }
 
-export async function checkProxy(
+async function checkProxy(
   url,
   {
     request_timeout_ms = DEFAULT_TIMEOUT_MS,
@@ -79,4 +79,7 @@ export async function checkProxy(
   }
 }
 
-export default checkProxy;
+module.exports = {
+  PROXY_STATUS,
+  checkProxy,
+};

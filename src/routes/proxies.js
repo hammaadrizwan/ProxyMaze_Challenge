@@ -36,7 +36,7 @@ router.post('/proxies', (req, res) => {
   // Start monitoring automatically
   monitor.start();
 
-  res.json({ total: added.length, proxies: added });
+  res.status(201).json({ total: added.length, proxies: added });
 });
 
 // GET /proxies — pool summary

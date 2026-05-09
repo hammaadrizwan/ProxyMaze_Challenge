@@ -64,19 +64,26 @@ async function dispatch(event, alert) {
     const key = deliveryKey(wh.url, alert.alert_id, event);
     if (delivered.has(key)) continue;
 
-    const payload = {
-      event,
-      alert_id: alert.alert_id,
-      status: alert.status,
-      failure_rate: alert.failure_rate,
-      total_proxies: alert.total_proxies,
-      failed_proxies: alert.failed_proxies,
-      failed_proxy_ids: alert.failed_proxy_ids,
-      threshold: alert.threshold,
-      fired_at: alert.fired_at,
-      resolved_at: alert.resolved_at || null,
-      message: alert.message,
-    };
+    let payload;
+    if (event === 'alert.fired') {
+      payload = {
+        event,
+        alert_id: alert.alert_id,
+        fired_at: alert.fired_at,
+        failure_rate: alert.failure_rate,
+        total_proxies: alert.total_proxies,
+        failed_proxies: alert.failed_proxies,
+        failed_proxy_ids: alert.failed_proxy_ids,
+        threshold: alert.threshold,
+        message: alert.message,
+      };
+    } else {
+      payload = {
+        event,
+        alert_id: alert.alert_id,
+        resolved_at: alert.resolved_at,
+      };
+    }
 
     promises.push(
       postWithRetry(wh.url, payload).then((result) => {
@@ -131,10 +138,12 @@ function buildSlackPayload(event, alert, intg) {
       {
         color,
         fields: [
-          { title: 'Status', value: alert.status, short: true },
+          { title: 'Alert ID', value: alert.alert_id, short: true },
+          { title: 'Threshold', value: String(alert.threshold), short: true },
           { title: 'Failure Rate', value: String(alert.failure_rate), short: true },
           { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`, short: true },
-          { title: 'Failed IDs', value: alert.failed_proxy_ids.join(', '), short: false },
+          { title: 'Fired At', value: alert.fired_at, short: true },
+          { title: 'Failed IDs', value: alert.failed_proxy_ids.join(', ') || 'None', short: false },
         ],
         footer: 'ProxyMaze Alert System',
         ts: toUnixSeconds(alert.fired_at),
@@ -158,7 +167,8 @@ function buildDiscordPayload(event, alert, intg) {
         description: alert.message,
         color,
         fields: [
-          { name: 'Status', value: alert.status, inline: true },
+          { name: 'Alert ID', value: alert.alert_id, inline: true },
+          { name: 'Threshold', value: String(alert.threshold), inline: true },
           { name: 'Failure Rate', value: String(alert.failure_rate), inline: true },
           { name: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`, inline: true },
           { name: 'Failed IDs', value: alert.failed_proxy_ids.join(', ') || 'None', inline: false },
@@ -171,4 +181,8 @@ function buildDiscordPayload(event, alert, intg) {
   };
 }
 
-module.exports = { dispatch };
+function reset() {
+  delivered.clear();
+}
+
+module.exports = { dispatch, reset };
