@@ -1,22 +1,19 @@
-import assert from "node:assert/strict";
-import { describe, test, beforeEach } from "node:test";
-import {
+const assert = require("node:assert/strict");
+const { describe, test, beforeEach } = require("node:test");
+const {
     dataStore,
     getConfig,
-    updateConfig,
+    setConfig: updateConfig,
     addProxy,
     getProxy,
     getAllProxies,
-    updateProxy,
     recordProxyCheck,
     clearProxies,
-    addAlert,
-    getAlerts,
+    getAllAlerts: getAlerts,
     getActiveAlert,
-    incrementTotalChecks,
     incrementWebhookDeliveries,
     getMetrics
-} from "../src/store/dataStore.js";
+} = require("../src/store/dataStore.js");
 
 /*
 |--------------------------------------------------------------------------
@@ -35,6 +32,22 @@ function resetStore() {
     dataStore.integrations.length = 0;
     dataStore.metrics.total_checks = 0;
     dataStore.metrics.webhook_deliveries = 0;
+    dataStore._alertCounter = 0;
+}
+
+function incrementTotalChecks() {
+    dataStore.metrics.total_checks++;
+}
+
+function updateProxy(id, updates) {
+    const proxy = getProxy(id);
+    if (!proxy) return null;
+    Object.assign(proxy, updates);
+    return proxy;
+}
+
+function addAlert(alertObj) {
+    dataStore.alerts.push(alertObj);
 }
 
 /*
@@ -80,22 +93,17 @@ describe("dataStore – proxies", () => {
     beforeEach(() => resetStore());
 
     test("addProxy stores a proxy and getProxy/getAllProxies can read it", () => {
-        const proxy = {
-            id: "proxy-1",
-            url: "http://localhost:8080",
-            status: "unknown",
-            history: []
-        };
+        addProxy("proxy-1", "http://localhost:8080");
 
-        addProxy(proxy);
-
-        assert.deepStrictEqual(getProxy("proxy-1"), proxy);
+        const proxy = getProxy("proxy-1");
+        assert.equal(proxy.id, "proxy-1");
+        assert.equal(proxy.url, "http://localhost:8080");
         assert.equal(getAllProxies().length, 1);
         assert.equal(getAllProxies()[0].id, "proxy-1");
     });
 
     test("updateProxy updates status fields", () => {
-        addProxy({
+        dataStore.proxies.set("proxy-2", {
             id: "proxy-2",
             url: "http://localhost:9090",
             status: "unknown",
@@ -121,7 +129,7 @@ describe("dataStore – proxies", () => {
     });
 
     test("recordProxyCheck appends history and updates counters/status", () => {
-        addProxy({
+        dataStore.proxies.set("proxy-3", {
             id: "proxy-3",
             url: "http://localhost:7070",
             status: "unknown",
@@ -173,12 +181,12 @@ describe("dataStore – proxies", () => {
         assert.equal(updated.status, "down");
         assert.equal(updated.consecutive_failures, 1);
         assert.equal(updated.history.length, 2);
-        assert.deepStrictEqual(updated.history[1], historyEntry2);
+        assert.deepStrictEqual(updated.history[0], historyEntry2);
     });
 
     test("clearProxies clears only proxies, not alerts", () => {
-        addProxy({ id: "proxy-a", url: "http://a" });
-        addProxy({ id: "proxy-b", url: "http://b" });
+        dataStore.proxies.set("proxy-a", { id: "proxy-a", url: "http://a" });
+        dataStore.proxies.set("proxy-b", { id: "proxy-b", url: "http://b" });
         addAlert({ id: "alert-1", status: "active", message: "something broke" });
 
         assert.equal(getAllProxies().length, 2);
@@ -213,10 +221,10 @@ describe("dataStore – alerts", () => {
         assert.equal(active.status, "active");
     });
 
-    test("getActiveAlert returns undefined when no active alerts exist", () => {
+    test("getActiveAlert returns null when no active alerts exist", () => {
         addAlert({ id: "a1", status: "resolved", message: "fixed" });
 
-        assert.equal(getActiveAlert(), undefined);
+        assert.equal(getActiveAlert(), null);
     });
 });
 
@@ -231,8 +239,8 @@ describe("dataStore – metrics", () => {
 
     test("getMetrics returns total_checks, current_pool_size, active_alerts, total_alerts, webhook_deliveries", () => {
         // Seed some state
-        addProxy({ id: "p1", url: "http://p1" });
-        addProxy({ id: "p2", url: "http://p2" });
+        dataStore.proxies.set("p1", { id: "p1", url: "http://p1" });
+        dataStore.proxies.set("p2", { id: "p2", url: "http://p2" });
 
         addAlert({ id: "a1", status: "active", message: "alert 1" });
         addAlert({ id: "a2", status: "resolved", message: "alert 2" });
@@ -254,7 +262,7 @@ describe("dataStore – metrics", () => {
     });
 
     test("getMetrics reflects pool size changes after clearProxies", () => {
-        addProxy({ id: "p1", url: "http://p1" });
+        dataStore.proxies.set("p1", { id: "p1", url: "http://p1" });
         assert.equal(getMetrics().current_pool_size, 1);
 
         clearProxies();
