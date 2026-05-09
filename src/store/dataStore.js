@@ -20,6 +20,25 @@ export const dataStore = {
 
 /*
 |--------------------------------------------------------------------------
+| Config Methods
+|--------------------------------------------------------------------------
+*/
+
+export function getConfig() {
+    return dataStore.config;
+}
+
+export function updateConfig(config) {
+    dataStore.config = {
+        ...dataStore.config,
+        ...config
+    };
+
+    return dataStore.config;
+}
+
+/*
+|--------------------------------------------------------------------------
 | Proxy Methods
 |--------------------------------------------------------------------------
 */
@@ -55,6 +74,20 @@ export function updateProxy(id, updates) {
     dataStore.proxies.set(id, updatedProxy);
 
     return updatedProxy;
+}
+
+export function recordProxyCheck(id, update) {
+    return updateProxy(id, {
+        status: update.status,
+        last_checked_at: update.last_checked_at,
+        consecutive_failures: update.consecutive_failures,
+        total_checks: update.total_checks,
+        up_checks: update.up_checks,
+        history: [
+            ...(getProxy(id)?.history || []),
+            update.historyEntry
+        ]
+    });
 }
 
 /*
