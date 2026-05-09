@@ -1,6 +1,6 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
-import { createMonitoringEngine } from "../src/services/monitoringEngine.js";
+const assert = require("node:assert/strict");
+const { test } = require("node:test");
+const { createMonitoringEngine } = require("../src/services/monitoringEngine.js");
 
 function createStore({ config, proxies }) {
   return {

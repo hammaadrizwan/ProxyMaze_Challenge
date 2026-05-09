@@ -1,7 +1,7 @@
-import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { test } from "node:test";
-import { checkProxy } from "../src/services/proxyChecker.js";
+const assert = require("node:assert/strict");
+const { createServer } = require("node:http");
+const { test } = require("node:test");
+const { checkProxy } = require("../src/services/proxyChecker.js");
 
 function createTestServer(handler) {
   const server = createServer(handler);

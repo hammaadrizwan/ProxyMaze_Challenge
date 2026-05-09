@@ -6,7 +6,7 @@
  */
 
 const { nowISO } = require('../utils/timestamps');
-const { v4: uuidv4 } = require('uuid');
+
 
 // State
 
@@ -268,6 +268,8 @@ function getMetrics() {
 // Exports
 
 module.exports = {
+  // Expose state for tests
+  dataStore: state,
   // Config
   getConfig,
   setConfig,
@@ -277,6 +279,7 @@ module.exports = {
   getAllProxies,
   clearProxies,
   updateProxyAfterCheck,
+  recordProxyCheck,
   getProxyPoolSummary,
   getFailedProxyIds,
   // Alerts
