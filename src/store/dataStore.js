@@ -12,8 +12,8 @@ const { nowISO } = require('../utils/timestamps');
 
 const state = {
   config: {
-    check_interval_seconds: 30,
-    request_timeout_ms: 5000,
+    check_interval_seconds: 15,
+    request_timeout_ms: 3000,
   },
 
   /** @type {Map<string, object>} proxyId → proxy object */
