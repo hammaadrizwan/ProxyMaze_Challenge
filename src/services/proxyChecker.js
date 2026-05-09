@@ -24,9 +24,12 @@ function createAbortController(timeoutMs) {
 }
 
 function responseStatus(statusCode) {
-  return statusCode >= 200 && statusCode <= 299
-    ? PROXY_STATUS.UP
-    : PROXY_STATUS.DOWN;
+  // 2xx, 3xx, and 4xx mean the proxy itself responded => UP
+  // Only 5xx counts as DOWN
+  if (statusCode >= 200 && statusCode <= 499) {
+    return PROXY_STATUS.UP;
+  }
+  return PROXY_STATUS.DOWN;
 }
 
 function errorReason(error) {
