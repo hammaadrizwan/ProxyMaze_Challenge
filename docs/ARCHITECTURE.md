@@ -1,229 +1,179 @@
-# 🏗️ ProxyMaze Architecture
+# ProxyMaze Architecture
 
-## System Overview
+ProxyMaze is a single-process Node.js service with an Express REST API, an
+in-memory state store, a continuous monitoring engine, an alert lifecycle manager,
+and outbound notification delivery.
 
-ProxyMaze is a **single-process Node.js service** with five core subsystems communicating through an in-memory data store. It exposes a REST API and runs background monitoring loops.
+The evaluator only sees the HTTP API, so every internal component must keep the
+API, alerts, webhooks, and integrations telling the same story about the same
+monitoring state.
 
----
+## System Shape
 
-## High-Level Architecture
-
-```
-                          ┌───────────────────────┐
-                          │      HTTP Clients      │
-                          │   (Evaluator / Users)  │
-                          └───────────┬───────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────┐
-                    │         Express REST API         │
-                    │  /health /config /proxies /alerts │
-                    │  /webhooks /integrations /metrics  │
-                    └────────────────┬────────────────┘
-                                     │
-                ┌────────────────────┼────────────────────┐
-                │                    │                    │
-                ▼                    ▼                    ▼
-    ┌───────────────┐   ┌───────────────────┐   ┌──────────────────┐
-    │  Config Store  │   │ Monitoring Engine │   │ Alert Manager    │
-    │               │   │ (Scheduler Loop)  │   │ (Lifecycle FSM)  │
-    └───────────────┘   └────────┬──────────┘   └────────┬─────────┘
-                                 │                       │
-                                 ▼                       ▼
-                     ┌──────────────────┐    ┌─────────────────────┐
-                     │  Proxy Checker   │    │ Notification Engine │
-                     │  (HTTP Probes)   │    │ Webhooks/Slack/     │
-                     └──────────────────┘    │ Discord             │
-                                             └─────────────────────┘
-                                 │                       │
-                                 ▼                       ▼
-                    ┌──────────────────────────────────────────┐
-                    │         In-Memory Data Store              │
-                    │  Proxies │ Alerts │ History │ Metrics     │
-                    └──────────────────────────────────────────┘
+```text
+HTTP evaluator / users
+        |
+        v
+Express REST API
+  |       |        |          |
+  |       |        |          +--> Integration registration
+  |       |        +-------------> Webhook registration
+  |       +----------------------> Config and proxy ingestion
+  +------------------------------> Read endpoints
+        |
+        v
+In-memory data store
+  |       |        |
+  |       |        +--> Metrics, history, alerts, delivery records
+  |       +-----------> Alert manager
+  +-------------------> Mushaf's monitoring engine
+                        |
+                        v
+                  Real HTTP probes
+                        |
+                        v
+                  Alert snapshot
+                        |
+                        v
+             Notification engine
+          webhooks / Slack / Discord
 ```
 
----
+## Core Subsystems
 
-## Core Components
+### REST API Layer
 
-### 1. REST API Layer (`src/routes/`)
+Owned by Hassan.
 
-| Responsibility | Details |
-|---|---|
-| Request routing | Maps HTTP methods + paths to handlers |
-| Input validation | Validates required fields, ignores unknown fields |
-| Response formatting | Consistent JSON responses |
-| Error handling | Proper HTTP status codes (200, 400, 404, 500) |
+Responsibilities:
 
-### 2. Monitoring Engine (`src/services/monitoringEngine.js`)
+- Expose the 12 challenge endpoints defined in `docs/API.md`.
+- Accept valid JSON request bodies and ignore unknown object fields.
+- Return exact challenge response codes, especially:
+  `201 Created` for `POST /proxies`, `204 No Content` for `DELETE /proxies`,
+  and `200 OK` or `201 Created` for `POST /integrations`.
+- Never trigger proxy probes from read endpoints.
+- Format API responses from the current store state.
 
-The heartbeat of the system. Runs a continuous loop that:
+### In-Memory Data Store
 
-```
-┌─── Start Cycle ──────────────────────────────────────────┐
-│                                                          │
-│  1. Read config (interval, timeout)                      │
-│  2. Get all proxies from store                           │
-│  3. For each proxy → HTTP HEAD/GET with timeout          │
-│  4. Update proxy status (pending → up/down)              │
-│  5. Record check in history                              │
-│  6. Compute failure_rate = down / total                  │
-│  7. If rate ≥ 0.20 → trigger Alert Manager               │
-│  8. If rate < 0.20 & active alert → resolve alert        │
-│  9. Wait check_interval_seconds                          │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
+Owned by Ridhushan.
 
-**Key design decisions:**
-- Probes run **concurrently** (Promise.all) for speed
-- Timeout is enforced per-probe via AbortController/Axios timeout
-- Only real HTTP probes — no simulated checks
+Stores:
 
-### 3. Alert Manager (`src/services/alertManager.js`)
+- Runtime config: `check_interval_seconds`, `request_timeout_ms`.
+- Proxies keyed by deterministic proxy ID.
+- Per-proxy counters and history.
+- Alerts, both active and resolved.
+- Webhook receivers and Slack/Discord integrations.
+- Metrics such as `total_checks`, `current_pool_size`, `active_alerts`,
+  `total_alerts`, and `webhook_deliveries`.
 
-Implements a **finite state machine** for alert lifecycle:
+Suggested proxy object:
 
-```
-                    ┌────────────┐
-        ┌──────────▶│   NORMAL   │◀──────────┐
-        │           └─────┬──────┘           │
-        │                 │ rate ≥ 0.20      │
-        │                 ▼                  │
-        │         ┌──────────────┐           │
-        │         │    ACTIVE    │           │
-        │         │  (1 alert)   │           │
-        │         └──────┬───────┘           │
-        │                │ rate < 0.20       │
-        │                ▼                   │
-        │         ┌──────────────┐           │
-        └─────────│   RESOLVED   │───────────┘
-          new      └──────────────┘  rate ≥ 0.20
-          breach                     (new alert_id)
-```
-
-**Invariants:**
-- Max 1 active alert at any time
-- Continuous breaches → same alert (no duplicates)
-- Recovery → resolve → re-breach → **new** alert ID
-- `failed_proxy_ids` must match across all systems
-
-### 4. Notification Engine (`src/services/notificationEngine.js`)
-
-Handles outbound delivery to webhooks, Slack, and Discord.
-
-```
-Event (alert.fired / alert.resolved)
-    │
-    ├──▶ Webhooks    → POST JSON payload → retry on 5xx
-    ├──▶ Slack       → POST Slack-formatted payload
-    └──▶ Discord     → POST Discord embed payload
-```
-
-**Retry strategy:**
-- Retry on: `500`, `502`, `503`, `504`
-- No retry on: `2xx`, `4xx`
-- No duplicate successful deliveries
-- Must complete within **60 seconds**
-
-### 5. In-Memory Data Store (`src/store/dataStore.js`)
-
-```
-dataStore = {
-    config: { check_interval_seconds, request_timeout_ms },
-    proxies: Map<id, ProxyObject>,
-    alerts: [],
-    webhooks: [],
-    integrations: [],
-    metrics: { total_checks, webhook_deliveries }
-}
-```
-
-**Why in-memory?**
-- Challenge is evaluated as a black box — persistence across restarts is not required
-- Zero external dependencies → simpler deployment
-- Sufficient for the scale of the challenge
-
----
-
-## Data Models
-
-### Proxy Object
-```javascript
+```js
 {
-    id: "px-101",               // from URL path
-    url: "https://...",         // original URL
-    status: "up",              // pending | up | down
-    last_checked_at: "...",    // ISO 8601 UTC
-    consecutive_failures: 0,
-    total_checks: 48,
-    up_checks: 46,
-    history: [ { checked_at, status, response_time_ms } ]
+  id: "px-101",
+  url: "https://proxy-provider.example/proxy/px-101",
+  status: "pending", // pending | up | down
+  last_checked_at: null,
+  consecutive_failures: 0,
+  total_checks: 0,
+  up_checks: 0,
+  history: []
 }
 ```
 
-### Alert Object
-```javascript
+Suggested alert object:
+
+```js
 {
-    alert_id: "alert-001",
-    status: "active",          // active | resolved
-    failure_rate: 0.30,
-    total_proxies: 10,
-    failed_proxies: 3,
-    failed_proxy_ids: ["px-103", "px-107"],
-    threshold: 0.20,
-    fired_at: "...",
-    resolved_at: null,
-    message: "..."
+  alert_id: "alert-a1b2c3",
+  status: "active",
+  failure_rate: 0.3,
+  total_proxies: 10,
+  failed_proxies: 3,
+  failed_proxy_ids: ["px-103", "px-104", "px-105"],
+  threshold: 0.2,
+  fired_at: "2026-04-24T10:20:00Z",
+  resolved_at: null,
+  message: "Proxy pool failure rate exceeded threshold"
 }
 ```
 
----
+### Monitoring Engine
 
-## Request Flow Example
+Owned by Mushaf.
 
-### Alert Firing Flow
+The monitoring engine is the heartbeat of ProxyMaze. It must run continuously in
+the background on the active `check_interval_seconds` cadence.
 
-```
-1. Monitoring cycle runs
-2. Probes 10 proxies → 3 fail → failure_rate = 0.30
-3. Alert Manager: no active alert → create alert-001 (status: active)
-4. Notification Engine:
-   a. POST to all registered webhooks
-   b. POST to Slack integrations (formatted)
-   c. POST to Discord integrations (formatted)
-5. GET /alerts returns alert-001 with status "active"
-```
+Cycle flow:
 
-### Alert Resolution Flow
+1. Read the current config and current proxy pool from the store.
+2. Probe all current proxy URLs concurrently using the current `request_timeout_ms`.
+3. Classify each result strictly from the real HTTP outcome:
+   2xx -> `up`; timeout, connection failure/refusal, or 5xx -> `down`.
+4. Update each proxy's `status`, `last_checked_at`, `consecutive_failures`,
+   `total_checks`, `up_checks`, and history.
+5. Compute `failure_rate = down / total` from current stored proxy state.
+6. Pass an exact snapshot to the alert manager:
+   `failure_rate`, `total_proxies`, `failed_proxies`, and `failed_proxy_ids`.
 
-```
-1. Monitoring cycle runs
-2. Probes 10 proxies → 1 fails → failure_rate = 0.10
-3. Alert Manager: active alert exists → resolve alert-001
-4. Notification Engine: sends "alert.resolved" to all channels
-5. GET /alerts returns alert-001 with status "resolved"
-```
+Runtime behavior:
 
----
+- New proxies remain `pending` until their first completed background probe.
+- `POST /proxies` starts monitoring if the pool is non-empty.
+- `POST /config` hot-reloads the cadence and timeout immediately for subsequent checks.
+- `DELETE /proxies` clears the pool and stops or idles monitoring without deleting alerts.
+- Empty pools should not divide by zero; use failure rate `0`.
 
-## Deployment
+### Alert Manager
 
-```
-┌──────────────────────────┐
-│     Node.js Process       │
-│                          │
-│   Express (port 3000)    │
-│   + Monitoring Loop      │
-│   + Notification Queue   │
-│                          │
-│   Single process,        │
-│   no external deps       │
-└──────────────────────────┘
-```
+Owned by Hammad.
 
-- **Port:** 3000 (configurable via `PORT` env var)
-- **No database** required
-- **No message queue** required
-- **No container** required (but Docker-friendly)
+The alert manager owns the alert lifecycle and threshold rule.
+
+Rules:
+
+- Threshold is fixed at `0.20`.
+- Fire when `failure_rate >= 0.20`.
+- Resolve when `failure_rate < 0.20`.
+- At most one alert can be active at a time.
+- A continuous breach keeps the same active alert and `alert_id`.
+- After resolution, a fresh breach creates a new `alert_id`.
+- Resolved alerts remain in the archive unchanged.
+
+### Notification Engine
+
+Owned by Hammad.
+
+The notification engine receives alert transition events from the alert manager and
+delivers them to registered receivers.
+
+Delivery requirements:
+
+- Send `alert.fired` and `alert.resolved` webhook events with
+  `Content-Type: application/json`.
+- Deliver each event to every registered receiver within 60 seconds of the transition.
+- Retry transient receiver failures: `500`, `502`, `503`, and `504`.
+- Record successful delivery so each transition reaches each receiver exactly once.
+- Send Slack and Discord formatted payloads for registered integrations.
+
+## Data Consistency Invariants
+
+- `GET /proxies` reports the latest completed background monitoring state.
+- `GET /alerts` and active breach webhooks must agree with `GET /proxies` on the
+  failed proxy set, failed count, total proxy count, and threshold.
+- `failed_proxy_ids` always equals the current set of proxies classified as `down`.
+- Alert history survives proxy replacement and `DELETE /proxies`.
+- Unknown request fields never change behavior unless they are part of the documented contract.
+
+## Implementation Stack
+
+- Runtime: Node.js 20+.
+- Framework: Express.
+- HTTP probing and delivery: Axios or native `fetch` with timeout support.
+- Scheduler: `setInterval` or equivalent interval management.
+- Storage: in-memory Maps and arrays.
+- Testing: Jest/Supertest or equivalent HTTP integration tests.
