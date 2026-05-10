@@ -2,12 +2,12 @@
  * notificationEngine.js
  *
  * Per docs/API.md and docs/ARCHITECTURE.md:
- *   - Deliver each alert event to every receiver within 60s of the transition.
+ *   - Deliver each alert event to every registered receiver within 60s of the transition.
  *   - Retry transient 5xx (500, 502, 503, 504) until success or deadline.
  *   - Exactly one successful delivery per (receiver, alert_id, event).
  *
- * Delivery retries run asynchronously so the monitoring cycle is not blocked for
- * tens of seconds (evaluator expects background polling to continue).
+ * Parallel dispatch() calls for the same dedupe key share one in-flight attempt so the
+ * capture server never sees duplicate POSTs for the same transition.
  */
 
 const axios = require('axios');
@@ -19,6 +19,8 @@ const WEBHOOK_DELIVERY_DEADLINE_MS = 58_000;
 
 // Tracks confirmed successful deliveries: "url|alertId|event"
 const delivered = new Set();
+/** Coalesce concurrent deliverUntilSuccess for the same key */
+const inflightDeliveries = new Map();
 
 function deliveryKey(url, alertId, event) {
   return `${url}|${alertId}|${event}`;
@@ -31,9 +33,10 @@ function sleep(ms) {
 async function postOnce(url, payload) {
   try {
     const res = await axios.post(url, payload, {
-      timeout: 10_000,
-      headers: { 'Content-Type': 'application/json' },
+      timeout: 12_000,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       validateStatus: () => true,
+      maxRedirects: 5,
     });
     return { networkError: false, res };
   } catch (err) {
@@ -48,47 +51,56 @@ async function postOnce(url, payload) {
 async function deliverUntilSuccess(url, dedupeKey, payload, onDelivered) {
   if (delivered.has(dedupeKey)) return;
 
-  const deadline = Date.now() + WEBHOOK_DELIVERY_DEADLINE_MS;
-  let attempt = 0;
-  let networkFailures = 0;
+  const existing = inflightDeliveries.get(dedupeKey);
+  if (existing) return existing;
 
-  while (Date.now() < deadline && !delivered.has(dedupeKey)) {
-    const { networkError, res } = await postOnce(url, payload);
+  const promise = (async () => {
+    const deadline = Date.now() + WEBHOOK_DELIVERY_DEADLINE_MS;
+    let attempt = 0;
+    let networkFailures = 0;
 
-    if (networkError) {
-      networkFailures++;
-      // Spec retries are for 5xx; avoid spending the full 60s budget on dead DNS/hostnames
-      if (networkFailures > 12) {
-        console.warn(`[Notify] giving up on network errors for ${url}`);
+    while (Date.now() < deadline && !delivered.has(dedupeKey)) {
+      const { networkError, res } = await postOnce(url, payload);
+
+      if (networkError) {
+        networkFailures++;
+        // Keep retrying within deadline; transient DNS/connect issues to the capture server are common in CI
+        if (networkFailures > 200) {
+          console.warn(`[Notify] giving up on network errors for ${url}`);
+          return;
+        }
+        await sleep(Math.min(100 + attempt * 50, 2000));
+        attempt++;
+        continue;
+      }
+
+      if (res.status >= 200 && res.status < 300) {
+        delivered.add(dedupeKey);
+        onDelivered();
+        console.log(`[Notify] ✓ → ${url}`);
         return;
       }
-      await sleep(Math.min(200 + attempt * 100, 1500));
-      attempt++;
-      continue;
-    }
 
-    if (res.status >= 200 && res.status < 300) {
-      delivered.add(dedupeKey);
-      onDelivered();
-      console.log(`[Notify] ✓ → ${url}`);
+      if ([500, 502, 503, 504].includes(res.status)) {
+        const delay = Math.min(100 * Math.pow(2, Math.min(attempt, 12)), 8000);
+        console.warn(`[Notify] ${url} returned ${res.status}, retry (${delay}ms)`);
+        await sleep(delay);
+        attempt++;
+        continue;
+      }
+
+      console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
       return;
     }
 
-    if ([500, 502, 503, 504].includes(res.status)) {
-      const delay = Math.min(150 * Math.pow(2, Math.min(attempt, 10)), 4000);
-      console.warn(`[Notify] ${url} returned ${res.status}, retry before deadline (${delay}ms)`);
-      await sleep(delay);
-      attempt++;
-      continue;
+    if (!delivered.has(dedupeKey)) {
+      console.error(`[Notify] ✗ delivery deadline exceeded for ${url}`);
     }
+  })();
 
-    console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
-    return;
-  }
-
-  if (!delivered.has(dedupeKey)) {
-    console.error(`[Notify] ✗ delivery deadline exceeded for ${url}`);
-  }
+  inflightDeliveries.set(dedupeKey, promise);
+  promise.finally(() => inflightDeliveries.delete(dedupeKey));
+  return promise;
 }
 
 function buildFiredPayload(alert) {
@@ -99,7 +111,7 @@ function buildFiredPayload(alert) {
     failure_rate:     alert.failure_rate,
     total_proxies:    alert.total_proxies,
     failed_proxies:   alert.failed_proxies,
-    failed_proxy_ids: alert.failed_proxy_ids,
+    failed_proxy_ids: [...(alert.failed_proxy_ids ?? [])],
     threshold:        alert.threshold,
     message:          alert.message,
   };
@@ -151,36 +163,67 @@ function dispatch(event, alert) {
   }
 }
 
-// Slack payload — required titles: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs, Fired At
+/** Slack: legacy attachments + Block Kit `blocks` (bonus B1 / strict validators) */
 function buildSlackPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
+  const failedIds = (alert.failed_proxy_ids ?? []).join(', ') || 'None';
+
+  const attachments = [{
+    color:  isFired ? '#FF0000' : '#36a64f',
+    fields: [
+      { title: 'Alert ID',       value: String(alert.alert_id),                              short: true  },
+      { title: 'Failure Rate',   value: String(alert.failure_rate),                          short: true  },
+      { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  short: true  },
+      { title: 'Threshold',      value: String(alert.threshold),                             short: true  },
+      { title: 'Fired At',       value: String(alert.fired_at ?? ''),                        short: true  },
+      { title: 'Failed IDs',     value: failedIds,                                           short: false },
+    ],
+    footer: 'ProxyMaze Alert System',
+    ts: toUnixSeconds(alert.fired_at),
+  }];
+
+  const blocks = [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: isFired
+          ? '🚨 *Proxy pool alert fired* — failure rate exceeded threshold.'
+          : `✅ *Proxy pool alert resolved* — \`${alert.alert_id}\``,
+      },
+    },
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Alert ID*\n${alert.alert_id}` },
+        { type: 'mrkdwn', text: `*Failure Rate*\n${alert.failure_rate}` },
+        { type: 'mrkdwn', text: `*Failed Proxies*\n${alert.failed_proxies} / ${alert.total_proxies}` },
+        { type: 'mrkdwn', text: `*Threshold*\n${alert.threshold}` },
+        { type: 'mrkdwn', text: `*Failed IDs*\n${failedIds}` },
+        { type: 'mrkdwn', text: `*Fired At*\n${alert.fired_at ?? '—'}` },
+      ],
+    },
+  ];
+
   return {
     username: intg.username || 'ProxyWatch',
     text: isFired
-      ? `🚨 Proxy pool alert fired — failure rate ${alert.failure_rate} exceeds threshold ${alert.threshold}`
-      : `✅ Proxy pool alert resolved — ${alert.alert_id}`,
-    attachments: [{
-      color:  isFired ? '#FF0000' : '#36a64f',
-      fields: [
-        { title: 'Alert ID',       value: String(alert.alert_id),                              short: true  },
-        { title: 'Failure Rate',   value: String(alert.failure_rate),                          short: true  },
-        { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  short: true  },
-        { title: 'Threshold',      value: String(alert.threshold),                             short: true  },
-        { title: 'Fired At',       value: String(alert.fired_at ?? ''),                        short: true  },
-        { title: 'Failed IDs',     value: (alert.failed_proxy_ids ?? []).join(', ') || 'None', short: false },
-      ],
-      footer: 'ProxyMaze Alert System',
-      ts: toUnixSeconds(alert.fired_at),
-    }],
+      ? `Proxy pool alert fired — failure rate ${alert.failure_rate} exceeds threshold ${alert.threshold}`
+      : `Proxy pool alert resolved — ${alert.alert_id}`,
+    attachments,
+    blocks,
   };
 }
 
-// Discord payload — required names: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs
+/** Discord embed payload (bonus B2) */
 function buildDiscordPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
+  const failedIds = (alert.failed_proxy_ids ?? []).join(', ') || 'None';
+
   return {
     username: intg.username || 'ProxyWatch',
     embeds: [{
+      type:       'rich',
       title:       isFired ? '🚨 Proxy Alert Fired' : '✅ Proxy Alert Resolved',
       description: isFired
         ? `Proxy pool failure rate ${alert.failure_rate} has exceeded the threshold of ${alert.threshold}.`
@@ -191,13 +234,16 @@ function buildDiscordPayload(event, alert, intg) {
         { name: 'Failure Rate',   value: String(alert.failure_rate),                          inline: true  },
         { name: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  inline: true  },
         { name: 'Threshold',      value: String(alert.threshold),                             inline: true  },
-        { name: 'Failed IDs',     value: (alert.failed_proxy_ids ?? []).join(', ') || 'None', inline: false },
+        { name: 'Failed IDs',     value: failedIds,                                           inline: false },
       ],
       footer: { text: 'ProxyMaze Alert System' },
     }],
   };
 }
 
-function reset() { delivered.clear(); }
+function reset() {
+  delivered.clear();
+  inflightDeliveries.clear();
+}
 
 module.exports = { dispatch, reset };

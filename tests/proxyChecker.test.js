@@ -55,6 +55,24 @@ test("classifies 5xx responses as down", async () => {
   }
 });
 
+test("classifies HTTP 408 Request Timeout as down", async () => {
+  const server = await createTestServer((request, response) => {
+    response.writeHead(408);
+    response.end();
+  });
+
+  try {
+    const result = await checkProxy(`${server.url}/timeout408`, {
+      request_timeout_ms: 500,
+    });
+
+    assert.equal(result.status, "down");
+    assert.equal(result.http_status, 408);
+  } finally {
+    await server.close();
+  }
+});
+
 test("classifies timeouts as down", async () => {
   const server = await createTestServer(() => {
     // Hold the request open until the client's timeout aborts it.
