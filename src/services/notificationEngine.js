@@ -1,188 +1,207 @@
 /**
  * notificationEngine.js
- * Delivers alert events to webhooks, Slack, and Discord integrations.
- * Handles retries for 5xx responses and prevents duplicate deliveries.
+ *
+ * Retry policy (per spec §7.0.4):
+ *   - Retry ONLY on HTTP 500, 502, 503, 504.
+ *   - Network errors (ENOTFOUND, ECONNREFUSED, etc.) → fail fast, do NOT retry.
+ *   - 2xx → success.  4xx → non-retryable.
+ *
+ * Exactly-once: key is marked delivered ONLY after a confirmed 2xx response.
+ * The delivered Set tracks (url, alertId, event) triples scoped to alert lifecycle.
  */
-
+ 
 const axios = require('axios');
 const store = require('../store/dataStore');
 const { toUnixSeconds } = require('../utils/timestamps');
-
-/** Track successfully delivered (webhookUrl, alertId, event) combos */
+ 
+// Tracks confirmed successful deliveries: "url|alertId|event"
 const delivered = new Set();
-
+ 
 function deliveryKey(url, alertId, event) {
   return `${url}|${alertId}|${event}`;
 }
-
-/**
- * POST with retry on 5xx. Max 3 retries, 2s apart.
- */
-async function postWithRetry(url, payload, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
+ 
+async function postWithRetry(url, payload, maxAttempts = 10) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let res;
     try {
-      const res = await axios.post(url, payload, {
+      res = await axios.post(url, payload, {
         timeout: 10000,
         headers: { 'Content-Type': 'application/json' },
         validateStatus: () => true,
       });
-      if (res.status >= 200 && res.status < 300) {
-        return { success: true, status: res.status };
-      }
-      // Retry only on 500, 502, 503, 504
-      if ([500, 502, 503, 504].includes(res.status) && attempt < retries) {
-        await sleep(2000);
-        continue;
-      }
-      return { success: false, status: res.status };
     } catch (err) {
-      if (attempt < retries) {
-        await sleep(2000);
-        continue;
-      }
-      return { success: false, status: 0 };
+      // Network-level failure (DNS, refused, etc.) — NOT a transient 5xx, do not retry.
+      console.warn(`[Notify] Network error to ${url}: ${err.message} — not retrying`);
+      return { success: false, status: 0, networkError: true };
     }
+ 
+    if (res.status >= 200 && res.status < 300) {
+      return { success: true, status: res.status };
+    }
+ 
+    if ([500, 502, 503, 504].includes(res.status)) {
+      const delay = Math.min(1000 * Math.pow(2, attempt), 16000);
+      console.warn(`[Notify] ${url} returned ${res.status}, retry ${attempt + 1}/${maxAttempts} in ${delay}ms`);
+      await sleep(delay);
+      continue;
+    }
+ 
+    // Non-retryable (4xx, 3xx, etc.)
+    console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
+    return { success: false, status: res.status };
   }
+ 
+  console.error(`[Notify] ${url} exhausted ${maxAttempts} retries`);
   return { success: false, status: 0 };
 }
-
+ 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
-/**
- * Dispatch an alert event to all registered receivers.
- * @param {string} event - "alert.fired" or "alert.resolved"
- * @param {object} alert - The alert object
- */
+ 
+function buildFiredPayload(alert) {
+  return {
+    event:            'alert.fired',
+    alert_id:         alert.alert_id,
+    fired_at:         alert.fired_at,
+    failure_rate:     alert.failure_rate,
+    total_proxies:    alert.total_proxies,
+    failed_proxies:   alert.failed_proxies,
+    failed_proxy_ids: alert.failed_proxy_ids,
+    threshold:        alert.threshold,
+    message:          alert.message,
+  };
+}
+ 
+function buildResolvedPayload(alert) {
+  return {
+    event:       'alert.resolved',
+    alert_id:    alert.alert_id,
+    resolved_at: alert.resolved_at,
+  };
+}
+ 
+async function deliverToReceiver(url, alertId, event, payload) {
+  const key = deliveryKey(url, alertId, event);
+ 
+  // Already successfully delivered — skip (exactly-once guarantee)
+  if (delivered.has(key)) {
+    console.log(`[Notify] Skip dup: ${key}`);
+    return;
+  }
+ 
+  const result = await postWithRetry(url, payload);
+ 
+  if (result.success) {
+    // Mark delivered ONLY after confirmed 2xx
+    delivered.add(key);
+    store.incrementWebhookDeliveries();
+    console.log(`[Notify] ✓ ${event} → ${url}`);
+  } else {
+    // Do NOT add to delivered — allow future retry on next alert cycle
+    if (!result.networkError) {
+      console.error(`[Notify] ✗ ${event} → ${url} (${result.status})`);
+    }
+  }
+}
+ 
 async function dispatch(event, alert) {
   const promises = [];
-
-  // ─── Webhooks ───
-  const webhooks = store.getWebhooks();
-  for (const wh of webhooks) {
-    const key = deliveryKey(wh.url, alert.alert_id, event);
-    if (delivered.has(key)) continue;
-
-    let payload;
-    if (event === 'alert.fired') {
-      payload = {
-        event,
-        alert_id: alert.alert_id,
-        fired_at: alert.fired_at,
-        failure_rate: alert.failure_rate,
-        total_proxies: alert.total_proxies,
-        failed_proxies: alert.failed_proxies,
-        failed_proxy_ids: alert.failed_proxy_ids,
-        threshold: alert.threshold,
-        message: alert.message,
-      };
-    } else {
-      payload = {
-        event,
-        alert_id: alert.alert_id,
-        resolved_at: alert.resolved_at,
-      };
-    }
-
-    promises.push(
-      postWithRetry(wh.url, payload).then((result) => {
-        if (result.success) {
-          delivered.add(key);
-          store.incrementWebhookDeliveries();
-        }
-      })
-    );
+ 
+  // Standard webhooks
+  for (const wh of store.getWebhooks()) {
+    const payload = event === 'alert.fired'
+      ? buildFiredPayload(alert)
+      : buildResolvedPayload(alert);
+ 
+    promises.push(deliverToReceiver(wh.url, alert.alert_id, event, payload));
   }
-
-  // ─── Integrations (Slack / Discord) ───
-  const integrations = store.getIntegrations();
-  for (const intg of integrations) {
+ 
+  // Slack / Discord integrations
+  for (const intg of store.getIntegrations()) {
     if (!intg.events.includes(event)) continue;
-
-    const key = deliveryKey(intg.webhook_url, alert.alert_id, event);
-    if (delivered.has(key)) continue;
-
-    let payload;
-    if (intg.type === 'slack') {
-      payload = buildSlackPayload(event, alert, intg);
-    } else if (intg.type === 'discord') {
-      payload = buildDiscordPayload(event, alert, intg);
-    } else {
+ 
+    const payload = intg.type === 'slack'
+      ? buildSlackPayload(event, alert, intg)
+      : intg.type === 'discord'
+        ? buildDiscordPayload(event, alert, intg)
+        : null;
+ 
+    if (!payload) continue;
+ 
+    // Use a distinct key space for integrations vs raw webhooks
+    const key = deliveryKey('intg:' + intg.webhook_url, alert.alert_id, event);
+    if (delivered.has(key)) {
+      console.log(`[Notify] Skip dup intg: ${key}`);
       continue;
     }
-
+ 
     promises.push(
       postWithRetry(intg.webhook_url, payload).then((result) => {
         if (result.success) {
           delivered.add(key);
           store.incrementWebhookDeliveries();
+          console.log(`[Notify] ✓ ${intg.type} ${event} → ${intg.webhook_url}`);
+        } else {
+          if (!result.networkError) {
+            console.error(`[Notify] ✗ ${intg.type} ${event} → ${intg.webhook_url} (${result.status})`);
+          }
         }
       })
     );
   }
-
-  // Fire-and-forget but within the 60s window
+ 
   await Promise.allSettled(promises);
 }
-
-// ─── Slack Payload ───────────────────────────────────────
-
+ 
+// Slack payload — required titles: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs, Fired At
 function buildSlackPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
-  const color = isFired ? '#FF0000' : '#36a64f';
   return {
     username: intg.username || 'ProxyWatch',
-    text: alert.message,
-    attachments: [
-      {
-        color,
-        fields: [
-          { title: 'Alert ID', value: alert.alert_id, short: true },
-          { title: 'Threshold', value: String(alert.threshold), short: true },
-          { title: 'Failure Rate', value: String(alert.failure_rate), short: true },
-          { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`, short: true },
-          { title: 'Fired At', value: alert.fired_at, short: true },
-          { title: 'Failed IDs', value: alert.failed_proxy_ids.join(', ') || 'None', short: false },
-        ],
-        footer: 'ProxyMaze Alert System',
-        ts: toUnixSeconds(alert.fired_at),
-      },
-    ],
+    text: isFired
+      ? `🚨 Proxy pool alert fired — failure rate ${alert.failure_rate} exceeds threshold ${alert.threshold}`
+      : `✅ Proxy pool alert resolved — ${alert.alert_id}`,
+    attachments: [{
+      color:  isFired ? '#FF0000' : '#36a64f',
+      fields: [
+        { title: 'Alert ID',       value: String(alert.alert_id),                              short: true  },
+        { title: 'Failure Rate',   value: String(alert.failure_rate),                          short: true  },
+        { title: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  short: true  },
+        { title: 'Threshold',      value: String(alert.threshold),                             short: true  },
+        { title: 'Fired At',       value: String(alert.fired_at ?? ''),                        short: true  },
+        { title: 'Failed IDs',     value: (alert.failed_proxy_ids ?? []).join(', ') || 'None', short: false },
+      ],
+      footer: 'ProxyMaze Alert System',
+      ts: toUnixSeconds(alert.fired_at),
+    }],
   };
 }
-
-// ─── Discord Payload ─────────────────────────────────────
-
+ 
+// Discord payload — required names: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs
 function buildDiscordPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
-  const color = isFired ? 16711680 : 3066993; // red : green
-  const title = isFired ? '🚨 Proxy Alert Fired' : '✅ Proxy Alert Resolved';
-
   return {
     username: intg.username || 'ProxyWatch',
-    embeds: [
-      {
-        title,
-        description: alert.message,
-        color,
-        fields: [
-          { name: 'Alert ID', value: alert.alert_id, inline: true },
-          { name: 'Threshold', value: String(alert.threshold), inline: true },
-          { name: 'Failure Rate', value: String(alert.failure_rate), inline: true },
-          { name: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`, inline: true },
-          { name: 'Failed IDs', value: alert.failed_proxy_ids.join(', ') || 'None', inline: false },
-        ],
-        footer: {
-          text: 'ProxyMaze Alert System',
-        },
-      },
-    ],
+    embeds: [{
+      title:       isFired ? '🚨 Proxy Alert Fired' : '✅ Proxy Alert Resolved',
+      description: isFired
+        ? `Proxy pool failure rate ${alert.failure_rate} has exceeded the threshold of ${alert.threshold}.`
+        : `Alert ${alert.alert_id} has been resolved. Failure rate recovered below ${alert.threshold}.`,
+      color:  isFired ? 16711680 : 3066993,
+      fields: [
+        { name: 'Alert ID',       value: String(alert.alert_id),                              inline: true  },
+        { name: 'Failure Rate',   value: String(alert.failure_rate),                          inline: true  },
+        { name: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  inline: true  },
+        { name: 'Threshold',      value: String(alert.threshold),                             inline: true  },
+        { name: 'Failed IDs',     value: (alert.failed_proxy_ids ?? []).join(', ') || 'None', inline: false },
+      ],
+      footer: { text: 'ProxyMaze Alert System' },
+    }],
   };
 }
-
-function reset() {
-  delivered.clear();
-}
-
+ 
+function reset() { delivered.clear(); }
+ 
 module.exports = { dispatch, reset };
