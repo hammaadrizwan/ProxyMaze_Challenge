@@ -105,3 +105,21 @@ test("classifies connection failures as down", async () => {
   assert.equal(result.status, "down");
   assert.equal(result.error, "connection_failure");
 });
+
+test("does not follow redirects — first response 302 stays visible", async () => {
+  const server = await createTestServer((request, response) => {
+    response.writeHead(302, { Location: "/elsewhere" });
+    response.end();
+  });
+
+  try {
+    const result = await checkProxy(`${server.url}/redirects`, {
+      request_timeout_ms: 500,
+    });
+
+    assert.equal(result.http_status, 302);
+    assert.equal(result.status, "up");
+  } finally {
+    await server.close();
+  }
+});

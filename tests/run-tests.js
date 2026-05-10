@@ -1,4 +1,5 @@
 require("./dataStore.test.js");
 require("./proxyChecker.test.js");
 require("./monitoringEngine.test.js");
+require("./notificationEngine.test.js");
 require("./api.test.js");

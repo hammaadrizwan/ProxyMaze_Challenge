@@ -99,8 +99,8 @@ async function checkProxy(
       timeout: timeoutMs,
       // Accept all status codes so we can classify them ourselves
       validateStatus: () => true,
-      // Don't follow redirects — a redirect could mask a down proxy
-      maxRedirects: 5,
+      // First response only — do not follow redirects (chain could mask down as up)
+      maxRedirects: 0,
     });
  
     const response_time_ms = Date.now() - startedAt;

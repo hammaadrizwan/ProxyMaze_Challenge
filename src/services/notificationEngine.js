@@ -4,6 +4,7 @@
  * Per docs/API.md and docs/ARCHITECTURE.md:
  *   - Deliver each alert event to every registered receiver within 60s of the transition.
  *   - Retry transient 5xx (500, 502, 503, 504) until success or deadline.
+ *   - Follow 301/302/307/308 manually with POST preserved (avoid POST→GET on redirect).
  *   - Exactly one successful delivery per (receiver, alert_id, event).
  *
  * Parallel dispatch() calls for the same dedupe key share one in-flight attempt so the
@@ -19,6 +20,13 @@ const { toUnixSeconds } = require('../utils/timestamps');
 /** Wall-clock budget per receiver (ms), under the 60s requirement */
 const WEBHOOK_DELIVERY_DEADLINE_MS = 58_000;
 
+/** Per-hop socket timeout for outbound POST (ms) */
+const OUTBOUND_POST_TIMEOUT_MS = 5000;
+
+const REDIRECT_STATUSES = new Set([301, 302, 307, 308]);
+const RETRY_5XX = new Set([500, 502, 503, 504]);
+const MAX_REDIRECT_HOPS = 20;
+
 // Tracks confirmed successful deliveries: "url|alertId|event"
 const delivered = new Set();
 /** Coalesce concurrent deliverUntilSuccess for the same key */
@@ -32,40 +40,60 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function postOnce(url, payload) {
+/**
+ * Single POST; no automatic redirect follow (caller handles 301/302/307/308).
+ */
+async function postOnce(targetUrl, payload) {
   return new Promise((resolve) => {
     try {
-      const u = new URL(url);
-      const lib = u.protocol === 'https:' ? https : http;
+      const parsedUrl = new URL(targetUrl);
+      const data = JSON.stringify(payload);
+      const port =
+        parsedUrl.port ||
+        (parsedUrl.protocol === 'https:' ? 443 : 80);
 
-      const req = lib.request({
+      const options = {
         method: 'POST',
-        hostname: u.hostname,
-        path: u.pathname + u.search,
+        hostname: parsedUrl.hostname,
+        port,
+        path: parsedUrl.pathname + parsedUrl.search,
         headers: {
           'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          Accept: 'application/json',
         },
-      }, (res) => {
-        let data = '';
+        timeout: OUTBOUND_POST_TIMEOUT_MS,
+      };
 
-        res.on('data', (c) => (data += c));
+      const lib = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = lib.request(options, (res) => {
+        let body = '';
+
+        res.on('data', (chunk) => (body += chunk));
+
         res.on('end', () => {
           resolve({
             networkError: false,
             res: {
               status: res.statusCode,
+              body,
               headers: res.headers,
-              data,
             },
           });
         });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ networkError: true, err: new Error('TIMEOUT') });
       });
 
       req.on('error', (err) => {
         resolve({ networkError: true, err });
       });
 
-      req.write(JSON.stringify(payload));
+      req.write(data);
       req.end();
     } catch (err) {
       resolve({ networkError: true, err });
@@ -75,9 +103,10 @@ async function postOnce(url, payload) {
 
 /**
  * POST until 2xx, or retries exhausted by deadline.
+ * Follows redirects with POST body preserved; retries 5xx with 1s delay.
  * Adds `dedupeKey` to `delivered` only after a confirmed 2xx.
  */
-async function deliverUntilSuccess(url, dedupeKey, payload, onDelivered) {
+async function deliverUntilSuccess(initialUrl, dedupeKey, payload, onDelivered) {
   if (delivered.has(dedupeKey)) return;
 
   const existing = inflightDeliveries.get(dedupeKey);
@@ -85,40 +114,52 @@ async function deliverUntilSuccess(url, dedupeKey, payload, onDelivered) {
 
   const promise = (async () => {
     const deadline = Date.now() + WEBHOOK_DELIVERY_DEADLINE_MS;
-    let attempt = 0;
-    let networkFailures = 0;
+    let currentUrl = initialUrl;
+    let redirectHops = 0;
 
     while (Date.now() < deadline && !delivered.has(dedupeKey)) {
-      const { networkError, res } = await postOnce(url, payload);
+      const { networkError, res } = await postOnce(currentUrl, payload);
 
       if (networkError) {
-        networkFailures++;
         await sleep(1000);
-        attempt++;
         continue;
       }
 
       if (res.status >= 200 && res.status < 300) {
         delivered.add(dedupeKey);
         onDelivered();
-        console.log(`[Notify] ✓ → ${url}`);
+        console.log(`[Notify] ✓ → ${currentUrl}`);
         return;
       }
 
-      if ([500, 502, 503, 504].includes(res.status)) {
-        const delay = Math.min(100 * Math.pow(2, Math.min(attempt, 12)), 8000);
-        console.warn(`[Notify] ${url} returned ${res.status}, retry (${delay}ms)`);
-        await sleep(delay);
-        attempt++;
+      const location = res.headers && res.headers.location;
+      if (location && REDIRECT_STATUSES.has(res.status)) {
+        redirectHops += 1;
+        if (redirectHops > MAX_REDIRECT_HOPS) {
+          console.warn(`[Notify] redirect limit exceeded for ${initialUrl}`);
+          return;
+        }
+        try {
+          currentUrl = new URL(location, currentUrl).href;
+        } catch (e) {
+          console.warn(`[Notify] bad Location header: ${location}`);
+          return;
+        }
         continue;
       }
 
-      console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
+      if (RETRY_5XX.has(res.status)) {
+        console.warn(`[Notify] ${currentUrl} returned ${res.status}, retry (1s)`);
+        await sleep(1000);
+        continue;
+      }
+
+      console.warn(`[Notify] ${currentUrl} returned non-retryable ${res.status}`);
       return;
     }
 
     if (!delivered.has(dedupeKey)) {
-      console.error(`[Notify] ✗ delivery deadline exceeded for ${url}`);
+      console.error(`[Notify] ✗ delivery deadline exceeded for ${initialUrl}`);
     }
   })();
 
@@ -187,7 +228,33 @@ function dispatch(event, alert) {
   }
 }
 
-/** Slack: legacy attachments + Block Kit `blocks` (bonus B1 / strict validators) */
+/**
+ * When POST /integrations runs while an alert is already active, deliver alert.fired once
+ * to the new receiver (same dedupe rules as dispatch).
+ */
+function dispatchFiredToNewIntegration(intg) {
+  const active = store.getActiveAlert();
+  if (!active) return;
+
+  const events = intg.events || ['alert.fired', 'alert.resolved'];
+  if (!events.includes('alert.fired')) return;
+
+  if (intg.type === 'slack') {
+    const payload = buildSlackPayload('alert.fired', active, intg);
+    const key = deliveryKey('intg:' + intg.webhook_url, active.alert_id, 'alert.fired');
+    void deliverUntilSuccess(intg.webhook_url, key, payload, () => {
+      store.incrementWebhookDeliveries();
+    }).catch((e) => console.error('[Notify] integration:', e));
+  } else if (intg.type === 'discord') {
+    const payload = buildDiscordPayload('alert.fired', active, intg);
+    const key = deliveryKey('intg:' + intg.webhook_url, active.alert_id, 'alert.fired');
+    void deliverUntilSuccess(intg.webhook_url, key, payload, () => {
+      store.incrementWebhookDeliveries();
+    }).catch((e) => console.error('[Notify] integration:', e));
+  }
+}
+
+/** Slack: legacy attachments + Block Kit `blocks` (bonus B1) */
 function buildSlackPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
   const failedIds = (alert.failed_proxy_ids ?? []).join(', ') || 'None';
@@ -208,23 +275,31 @@ function buildSlackPayload(event, alert, intg) {
 
   const blocks = [
     {
+      type: 'header',
+      text: {
+        type: 'plain_text',
+        text: isFired ? 'Proxy pool alert fired' : 'Proxy pool alert resolved',
+        emoji: true,
+      },
+    },
+    {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text: isFired
-          ? '🚨 *Proxy pool alert fired* — failure rate exceeded threshold.'
-          : `✅ *Proxy pool alert resolved* — \`${alert.alert_id}\``,
+          ? '*Failure rate exceeded threshold.*'
+          : `*Alert resolved:* \`${alert.alert_id}\``,
       },
     },
     {
       type: 'section',
       fields: [
         { type: 'mrkdwn', text: `*Alert ID*\n${alert.alert_id}` },
-        { type: 'mrkdwn', text: `*Failure Rate*\n${alert.failure_rate}` },
-        { type: 'mrkdwn', text: `*Failed Proxies*\n${alert.failed_proxies} / ${alert.total_proxies}` },
+        { type: 'mrkdwn', text: `*Failure rate*\n${alert.failure_rate}` },
+        { type: 'mrkdwn', text: `*Failed proxies*\n${alert.failed_proxies} / ${alert.total_proxies}` },
         { type: 'mrkdwn', text: `*Threshold*\n${alert.threshold}` },
         { type: 'mrkdwn', text: `*Failed IDs*\n${failedIds}` },
-        { type: 'mrkdwn', text: `*Fired At*\n${alert.fired_at ?? '—'}` },
+        { type: 'mrkdwn', text: `*Fired at*\n${alert.fired_at ?? '—'}` },
       ],
     },
   ];
@@ -247,8 +322,8 @@ function buildDiscordPayload(event, alert, intg) {
   return {
     username: intg.username || 'ProxyWatch',
     embeds: [{
-      type:       'rich',
-      title:       isFired ? '🚨 Proxy Alert Fired' : '✅ Proxy Alert Resolved',
+      type:        'rich',
+      title:       isFired ? 'Proxy Alert Fired' : 'Proxy Alert Resolved',
       description: isFired
         ? `Proxy pool failure rate ${alert.failure_rate} has exceeded the threshold of ${alert.threshold}.`
         : `Alert ${alert.alert_id} has been resolved. Failure rate recovered below ${alert.threshold}.`,
@@ -258,7 +333,7 @@ function buildDiscordPayload(event, alert, intg) {
         { name: 'Failure Rate',   value: String(alert.failure_rate),                          inline: true  },
         { name: 'Failed Proxies', value: `${alert.failed_proxies} / ${alert.total_proxies}`,  inline: true  },
         { name: 'Threshold',      value: String(alert.threshold),                             inline: true  },
-        { name: 'Failed IDs',     value: failedIds,                                           inline: false },
+        { name: 'Failed IDs',     value: failedIds.length > 1024 ? failedIds.slice(0, 1021) + '…' : failedIds, inline: false },
       ],
       footer: { text: 'ProxyMaze Alert System' },
     }],
@@ -270,4 +345,10 @@ function reset() {
   inflightDeliveries.clear();
 }
 
-module.exports = { dispatch, reset };
+module.exports = {
+  dispatch,
+  dispatchFiredToNewIntegration,
+  reset,
+  /** Exposed for tests — POST with redirect/5xx retry semantics */
+  deliverUntilSuccess,
+};
