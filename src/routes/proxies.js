@@ -10,33 +10,38 @@ const monitor  = require('../services/monitoringEngine');
 const router = Router();
  
 // POST /proxies — load proxies into pool
-router.post('/proxies', (req, res) => {
+router.post('/proxies', async (req, res) => {
   const { proxies, replace } = req.body;
- 
+
   if (!Array.isArray(proxies)) {
     return res.status(400).json({ error: 'proxies must be an array of URLs' });
   }
- 
+
   if (replace === true) {
     // Stop monitoring before clearing so the cycle doesn't race with the clear
     if (monitor.getStatus()) monitor.stop();
     store.clearProxies();
+    // Evaluate empty pool so stray active alerts resolve before new proxies load
+    try {
+      await monitor.onPoolChanged();
+    } catch (err) {
+      console.error('[Monitor] onPoolChanged (cleared pool):', err);
+    }
   }
- 
+
   const added = [];
   for (const url of proxies) {
     const id    = extractProxyId(url);
     const proxy = store.addProxy(id, url);
     added.push({ id: proxy.id, url: proxy.url, status: proxy.status });
   }
- 
-  // Start monitoring if not already running (covers both replace and append cases)
-  if (!monitor.getStatus() && store.getAllProxies().length > 0) {
-    monitor.start().catch((err) => {
-      console.error('[Monitor] Failed to start:', err);
-    });
+
+  try {
+    await monitor.onPoolChanged();
+  } catch (err) {
+    console.error('[Monitor] onPoolChanged:', err);
   }
- 
+
   res.status(201).json({ accepted: added.length, proxies: added });
 });
  
@@ -94,9 +99,13 @@ router.get('/proxies/:id/history', (req, res) => {
 });
  
 // DELETE /proxies — clear pool; alerts and history survive
-router.delete('/proxies', (req, res) => {
-  if (monitor.getStatus()) monitor.stop();
+router.delete('/proxies', async (req, res) => {
   store.clearProxies();
+  try {
+    await monitor.onPoolChanged();
+  } catch (err) {
+    console.error('[Monitor] onPoolChanged:', err);
+  }
   res.status(204).send();
 });
  
