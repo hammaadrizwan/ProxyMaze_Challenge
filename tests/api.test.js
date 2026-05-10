@@ -44,7 +44,11 @@ function createReceiver() {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      received.push(JSON.parse(body));
+      try {
+        received.push(body ? JSON.parse(body) : {});
+      } catch {
+        received.push({ _raw: body });
+      }
       res.writeHead(200);
       res.end();
     });

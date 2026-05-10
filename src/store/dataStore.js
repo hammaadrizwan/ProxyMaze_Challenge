@@ -124,7 +124,8 @@ function getProxyPoolSummary() {
 function getFailedProxyIds() {
   return getAllProxies()
     .filter((p) => p.status === 'down')
-    .map((p) => p.id);
+    .map((p) => p.id)
+    .sort();
 }
  
 // ─── Alerts ───────────────────────────────────────────────────────────────────
