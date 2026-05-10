@@ -106,18 +106,46 @@ test("classifies connection failures as down", async () => {
   assert.equal(result.error, "connection_failure");
 });
 
-test("does not follow redirects — first response 302 stays visible", async () => {
+test("follows redirect then classifies final 503 as down", async () => {
   const server = await createTestServer((request, response) => {
-    response.writeHead(302, { Location: "/elsewhere" });
+    if (request.url === "/bad") {
+      response.writeHead(503);
+      response.end();
+      return;
+    }
+    response.writeHead(302, { Location: "/bad" });
     response.end();
   });
 
   try {
-    const result = await checkProxy(`${server.url}/redirects`, {
+    const result = await checkProxy(`${server.url}/via-redirect`, {
       request_timeout_ms: 500,
     });
 
-    assert.equal(result.http_status, 302);
+    assert.equal(result.http_status, 503);
+    assert.equal(result.status, "down");
+  } finally {
+    await server.close();
+  }
+});
+
+test("follows relative redirect to 200 as up", async () => {
+  const server = await createTestServer((request, response) => {
+    if (request.url === "/final") {
+      response.writeHead(200);
+      response.end();
+      return;
+    }
+    response.writeHead(302, { Location: "/final" });
+    response.end();
+  });
+
+  try {
+    const result = await checkProxy(`${server.url}/start`, {
+      request_timeout_ms: 500,
+    });
+
+    assert.equal(result.http_status, 200);
     assert.equal(result.status, "up");
   } finally {
     await server.close();
