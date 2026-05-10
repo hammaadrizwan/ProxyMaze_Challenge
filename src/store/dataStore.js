@@ -85,28 +85,27 @@ function clearProxies() {
  
 /**
  * Called by the monitoring engine after each probe.
- * Updates all mutable proxy fields and appends to history (chronological, oldest first).
+ * Updates all mutable proxy fields and appends to history.
  */
 function recordProxyCheck(id, update) {
   const proxy = state.proxies.get(id);
   if (!proxy) return null;
-
+ 
   proxy.status = update.status;
   proxy.last_checked_at = update.last_checked_at;
-
   proxy.consecutive_failures = update.consecutive_failures;
   proxy.total_checks = update.total_checks;
   proxy.up_checks = update.up_checks;
-
+ 
   if (!Array.isArray(proxy.history)) {
     proxy.history = [];
   }
-
-  // 🔥 FIX: newest-first (THIS IS WHAT TESTS EXPECT)
+ 
+  // newest-first ordering
   proxy.history.unshift(update.historyEntry);
-
+ 
   state.metrics.total_checks += 1;
-
+ 
   return proxy;
 }
  
@@ -137,19 +136,35 @@ function getActiveAlert() {
 function createAlert(failureRate, totalProxies, failedProxies, failedProxyIds) {
   state._alertCounter += 1;
   const alert = {
-    alert_id:        `alert-${String(state._alertCounter).padStart(3, '0')}`,
-    status:          'active',
-    failure_rate:    failureRate,
-    total_proxies:   totalProxies,
-    failed_proxies:  failedProxies,
+    alert_id:         `alert-${String(state._alertCounter).padStart(3, '0')}`,
+    status:           'active',
+    failure_rate:     failureRate,
+    total_proxies:    totalProxies,
+    failed_proxies:   failedProxies,
     failed_proxy_ids: [...failedProxyIds],
-    threshold:       0.20,
-    fired_at:        nowISO(),
-    resolved_at:     null,
-    // Spec example message — keep consistent and non-empty.
-    message:         'Proxy pool failure rate exceeded threshold',
+    threshold:        0.20,
+    fired_at:         nowISO(),
+    resolved_at:      null,
+    message:          'Proxy pool failure rate exceeded threshold',
   };
   state.alerts.push(alert);
+  return alert;
+}
+ 
+/**
+ * Updates the active alert's live fields to reflect the current monitoring snapshot.
+ * Called every cycle while a breach continues to keep failed_proxy_ids current.
+ * This ensures GET /alerts, GET /proxies, and webhook payloads all agree.
+ */
+function updateActiveAlert(failureRate, totalProxies, failedProxies, failedProxyIds) {
+  const alert = getActiveAlert();
+  if (!alert) return null;
+ 
+  alert.failure_rate     = failureRate;
+  alert.total_proxies    = totalProxies;
+  alert.failed_proxies   = failedProxies;
+  alert.failed_proxy_ids = [...failedProxyIds];
+ 
   return alert;
 }
  
@@ -159,8 +174,6 @@ function resolveAlert(alertId) {
  
   alert.status      = 'resolved';
   alert.resolved_at = nowISO();
-  // Do NOT overwrite alert.message — preserve the original fired message.
-  // The spec only requires message to be non-empty; the fired message satisfies that.
  
   return alert;
 }
@@ -174,9 +187,9 @@ function getAllAlerts() {
 function addWebhook(url) {
   state._webhookCounter += 1;
   const wh = {
-    webhook_id:     `wh-${String(state._webhookCounter).padStart(3, '0')}`,
+    webhook_id:    `wh-${String(state._webhookCounter).padStart(3, '0')}`,
     url,
-    registered_at:  nowISO(),
+    registered_at: nowISO(),
   };
   state.webhooks.push(wh);
   return wh;
@@ -245,6 +258,7 @@ module.exports = {
   // Alerts
   getActiveAlert,
   createAlert,
+  updateActiveAlert,
   resolveAlert,
   getAllAlerts,
  

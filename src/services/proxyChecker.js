@@ -8,7 +8,12 @@
  *   - Timeout, connection failure/refusal      →  "down"
  *   - Any 5xx response                         →  "down"
  *   - Any other non-2xx (3xx, 4xx)             →  "down"  (safe default)
+ *
+ * Uses axios so that 5xx responses are received as responses (not throws),
+ * and timeouts / connection errors are caught as errors.
  */
+ 
+const axios = require('axios');
  
 const DEFAULT_TIMEOUT_MS = 3000;
  
@@ -35,17 +40,27 @@ function classifyStatus(statusCode) {
 }
  
 /**
- * Map an AbortError or network error to a reason string.
+ * Map an axios error to a reason string.
  */
 function errorReason(error) {
-  if (!error) return 'unknown';
-  const name = error.name || '';
-  const code = error.code || '';
-  const msg  = (error.message || '').toLowerCase();
+  if (!error) return 'connection_failure';
  
-  if (name === 'AbortError' || msg.includes('abort')) return 'timeout';
-  if (code === 'ECONNREFUSED' || msg.includes('connect')) return 'connection_failure';
-  if (code === 'ENOTFOUND' || msg.includes('network') || msg.includes('fetch')) return 'connection_failure';
+  // axios timeout
+  if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+    return 'timeout';
+  }
+ 
+  // Connection refused, DNS failure, network error
+  if (
+    error.code === 'ECONNREFUSED' ||
+    error.code === 'ENOTFOUND' ||
+    error.code === 'ECONNRESET' ||
+    error.code === 'EHOSTUNREACH' ||
+    error.code === 'ENETUNREACH'
+  ) {
+    return 'connection_failure';
+  }
+ 
   return 'connection_failure';
 }
  
@@ -55,8 +70,6 @@ function errorReason(error) {
  * @param {string} url - The proxy URL to probe.
  * @param {object} options
  * @param {number} [options.request_timeout_ms=3000]
- * @param {Function} [options.fetchImpl=globalThis.fetch]
- * @param {string}   [options.method='GET']
  * @param {Function} [options.now=() => new Date()]
  *
  * @returns {Promise<{ status: 'up'|'down', checked_at: string, response_time_ms: number, http_status?: number, error?: string }>}
@@ -65,24 +78,23 @@ async function checkProxy(
   url,
   {
     request_timeout_ms = DEFAULT_TIMEOUT_MS,
-    fetchImpl          = globalThis.fetch,
-    method             = 'GET',
     now                = () => new Date(),
   } = {},
 ) {
-  if (typeof fetchImpl !== 'function') {
-    throw new TypeError('checkProxy requires a fetch implementation');
-  }
- 
-  const timeoutMs   = normalizeTimeout(request_timeout_ms);
-  const startedAt   = Date.now();
-  const controller  = new AbortController();
-  const timer       = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutMs  = normalizeTimeout(request_timeout_ms);
+  const startedAt  = Date.now();
  
   try {
-    const response       = await fetchImpl(url, { method, signal: controller.signal });
+    const response = await axios.get(url, {
+      timeout: timeoutMs,
+      // Accept all status codes so we can classify them ourselves
+      validateStatus: () => true,
+      // Don't follow redirects — a redirect could mask a down proxy
+      maxRedirects: 5,
+    });
+ 
     const response_time_ms = Date.now() - startedAt;
-    const status         = classifyStatus(response.status);
+    const status = classifyStatus(response.status);
  
     return {
       status,
@@ -97,8 +109,6 @@ async function checkProxy(
       response_time_ms:  Date.now() - startedAt,
       error:             errorReason(error),
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
  
