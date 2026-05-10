@@ -10,7 +10,9 @@
  * capture server never sees duplicate POSTs for the same transition.
  */
 
-const axios = require('axios');
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
 const store = require('../store/dataStore');
 const { toUnixSeconds } = require('../utils/timestamps');
 
@@ -31,17 +33,44 @@ function sleep(ms) {
 }
 
 async function postOnce(url, payload) {
-  try {
-    const res = await axios.post(url, payload, {
-      timeout: 12_000,
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      validateStatus: () => true,
-      maxRedirects: 5,
-    });
-    return { networkError: false, res };
-  } catch (err) {
-    return { networkError: true, err };
-  }
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const lib = u.protocol === 'https:' ? https : http;
+
+      const req = lib.request({
+        method: 'POST',
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      }, (res) => {
+        let data = '';
+
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
+          resolve({
+            networkError: false,
+            res: {
+              status: res.statusCode,
+              headers: res.headers,
+              data,
+            },
+          });
+        });
+      });
+
+      req.on('error', (err) => {
+        resolve({ networkError: true, err });
+      });
+
+      req.write(JSON.stringify(payload));
+      req.end();
+    } catch (err) {
+      resolve({ networkError: true, err });
+    }
+  });
 }
 
 /**
@@ -64,12 +93,7 @@ async function deliverUntilSuccess(url, dedupeKey, payload, onDelivered) {
 
       if (networkError) {
         networkFailures++;
-        // Keep retrying within deadline; transient DNS/connect issues to the capture server are common in CI
-        if (networkFailures > 200) {
-          console.warn(`[Notify] giving up on network errors for ${url}`);
-          return;
-        }
-        await sleep(Math.min(100 + attempt * 50, 2000));
+        await sleep(1000);
         attempt++;
         continue;
       }
