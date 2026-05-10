@@ -7,7 +7,8 @@
  *   - 2xx response within request_timeout_ms  →  "up"
  *   - Timeout, connection failure/refusal      →  "down"
  *   - Any 5xx response                         →  "down"
- *   - Any other non-2xx (3xx, 4xx)             →  "down"  (safe default)
+ *   - HTTP 408 Request Timeout                 →  "down" (timeout as status, not axios abort)
+ *   - Other 3xx/4xx                            →  "up" (not listed as down in API)
  *
  * Uses axios so that 5xx responses are received as responses (not throws),
  * and timeouts / connection errors are caught as errors.
@@ -33,13 +34,13 @@ function nowIso(now) {
  
 /**
  * Classify an HTTP status code per docs/API.md:
- *   - 2xx within timeout → up
- *   - any 5xx → down
- * Other HTTP codes (3xx/4xx) are not listed as "down"; treat as up so only
- * timeouts, connection failures, and 5xx match the evaluator's failure rules.
+ *   - 2xx → up
+ *   - 5xx → down
+ *   - 408 Request Timeout → down (evaluator “timeout” path may return 408 instead of aborting)
  */
 function classifyHttpStatus(statusCode) {
   if (statusCode >= 200 && statusCode < 300) return PROXY_STATUS.UP;
+  if (statusCode === 408) return PROXY_STATUS.DOWN;
   if (statusCode >= 500 && statusCode < 600) return PROXY_STATUS.DOWN;
   return PROXY_STATUS.UP;
 }
@@ -50,8 +51,12 @@ function classifyHttpStatus(statusCode) {
 function errorReason(error) {
   if (!error) return 'connection_failure';
  
-  // axios timeout
-  if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+  // axios / Node timeouts
+  if (
+    error.code === 'ECONNABORTED' ||
+    error.code === 'ETIMEDOUT' ||
+    error.message?.includes('timeout')
+  ) {
     return 'timeout';
   }
  

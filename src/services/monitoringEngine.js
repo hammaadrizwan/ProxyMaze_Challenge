@@ -98,10 +98,10 @@ async function recordCheck(storeRef, proxy, result) {
  
 function buildSnapshot(proxies) {
   const total_proxies    = proxies.length;
+  // Preserve pool iteration order (matches GET /proxies and evaluator ground truth)
   const failed_proxy_ids = proxies
     .filter((p) => p.status === PROXY_STATUS.DOWN)
-    .map((p) => p.id)
-    .sort();
+    .map((p) => p.id);
   const failed_proxies   = failed_proxy_ids.length;
   const failure_rate     = total_proxies === 0 ? 0 : failed_proxies / total_proxies;
 
