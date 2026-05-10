@@ -32,11 +32,16 @@ function nowIso(now) {
 }
  
 /**
- * Classify an HTTP status code.
- * 2xx → up; everything else → down.
+ * Classify an HTTP status code per docs/API.md:
+ *   - 2xx within timeout → up
+ *   - any 5xx → down
+ * Other HTTP codes (3xx/4xx) are not listed as "down"; treat as up so only
+ * timeouts, connection failures, and 5xx match the evaluator's failure rules.
  */
-function classifyStatus(statusCode) {
-  return statusCode >= 200 && statusCode < 300 ? PROXY_STATUS.UP : PROXY_STATUS.DOWN;
+function classifyHttpStatus(statusCode) {
+  if (statusCode >= 200 && statusCode < 300) return PROXY_STATUS.UP;
+  if (statusCode >= 500 && statusCode < 600) return PROXY_STATUS.DOWN;
+  return PROXY_STATUS.UP;
 }
  
 /**
@@ -94,8 +99,8 @@ async function checkProxy(
     });
  
     const response_time_ms = Date.now() - startedAt;
-    const status = classifyStatus(response.status);
- 
+    const status = classifyHttpStatus(response.status);
+
     return {
       status,
       checked_at:        nowIso(now),

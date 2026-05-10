@@ -98,10 +98,13 @@ async function recordCheck(storeRef, proxy, result) {
  
 function buildSnapshot(proxies) {
   const total_proxies    = proxies.length;
-  const failed_proxy_ids = proxies.filter((p) => p.status === PROXY_STATUS.DOWN).map((p) => p.id);
+  const failed_proxy_ids = proxies
+    .filter((p) => p.status === PROXY_STATUS.DOWN)
+    .map((p) => p.id)
+    .sort();
   const failed_proxies   = failed_proxy_ids.length;
   const failure_rate     = total_proxies === 0 ? 0 : failed_proxies / total_proxies;
- 
+
   return { failure_rate, total_proxies, failed_proxies, failed_proxy_ids };
 }
  
@@ -129,7 +132,7 @@ class MonitoringEngine {
     now:             nowFn          = () => new Date(),
   } = {}) {
     if (!storeRef) throw new TypeError('MonitoringEngine requires a store');
- 
+
     this.store           = storeRef;
     this.alertManager    = alertMgr;
     this.checkProxy      = checkProxyFn;
@@ -138,20 +141,26 @@ class MonitoringEngine {
     this.now             = nowFn;
     this.timer           = null;
     this.cycleInProgress = false;
+    /** Prevents concurrent start() from registering duplicate intervals */
+    this._starting       = false;
   }
  
   get isRunning() { return this.timer !== null; }
  
   async start({ runImmediately = true } = {}) {
-    if (this.isRunning) return;
- 
-    const config     = await getConfig(this.store);
-    const intervalMs = config.check_interval_seconds * 1000;
- 
-    this.timer = this.setIntervalFn(() => { void this.runCycle(); }, intervalMs);
-    if (typeof this.timer?.unref === 'function') this.timer.unref();
- 
-    if (runImmediately) await this.runCycle();
+    if (this.isRunning || this._starting) return;
+    this._starting = true;
+
+    try {
+      const config     = await getConfig(this.store);
+      const intervalMs = config.check_interval_seconds * 1000;
+
+      this.timer = this.setIntervalFn(() => { void this.runCycle(); }, intervalMs);
+
+      if (runImmediately) await this.runCycle();
+    } finally {
+      this._starting = false;
+    }
   }
  
   stop() {
@@ -171,7 +180,13 @@ class MonitoringEngine {
  
   async onPoolChanged() {
     const proxies = await getProxyList(this.store);
-    if (proxies.length === 0) { this.stop(); return; }
+    if (proxies.length === 0) {
+      this.stop();
+      // Empty pool ⇒ failure_rate 0; resolves any active alert so a new pool can fire fresh webhooks
+      const snapshot = buildSnapshot([]);
+      await sendSnapshot(this.alertManager, snapshot);
+      return;
+    }
     if (!this.isRunning) await this.start({ runImmediately: true });
   }
  
@@ -229,12 +244,13 @@ class MonitoringEngine {
 const defaultMonitor = new MonitoringEngine({ store, alertManager });
  
 module.exports = {
-  start:    (opts) => defaultMonitor.start(opts),
-  stop:     ()     => defaultMonitor.stop(),
-  restart:  (opts) => defaultMonitor.restart(opts),
-  getStatus: ()    => defaultMonitor.isRunning,
-  runCycle: ()     => defaultMonitor.runCycle(),
- 
+  start:         (opts) => defaultMonitor.start(opts),
+  stop:          ()     => defaultMonitor.stop(),
+  restart:       (opts) => defaultMonitor.restart(opts),
+  onPoolChanged: ()     => defaultMonitor.onPoolChanged(),
+  getStatus:     ()    => defaultMonitor.isRunning,
+  runCycle:      ()     => defaultMonitor.runCycle(),
+
   // Exported for test injection
   MonitoringEngine,
   createMonitoringEngine: (opts) => new MonitoringEngine(opts),
