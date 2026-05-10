@@ -1,65 +1,96 @@
 /**
  * notificationEngine.js
  *
- * Retry policy (per spec §7.0.4):
- *   - Retry ONLY on HTTP 500, 502, 503, 504.
- *   - Network errors (ENOTFOUND, ECONNREFUSED, etc.) → fail fast, do NOT retry.
- *   - 2xx → success.  4xx → non-retryable.
+ * Per docs/API.md and docs/ARCHITECTURE.md:
+ *   - Deliver each alert event to every receiver within 60s of the transition.
+ *   - Retry transient 5xx (500, 502, 503, 504) until success or deadline.
+ *   - Exactly one successful delivery per (receiver, alert_id, event).
  *
- * Exactly-once: key is marked delivered ONLY after a confirmed 2xx response.
- * The delivered Set tracks (url, alertId, event) triples scoped to alert lifecycle.
+ * Delivery retries run asynchronously so the monitoring cycle is not blocked for
+ * tens of seconds (evaluator expects background polling to continue).
  */
- 
+
 const axios = require('axios');
 const store = require('../store/dataStore');
 const { toUnixSeconds } = require('../utils/timestamps');
- 
+
+/** Wall-clock budget per receiver (ms), under the 60s requirement */
+const WEBHOOK_DELIVERY_DEADLINE_MS = 58_000;
+
 // Tracks confirmed successful deliveries: "url|alertId|event"
 const delivered = new Set();
- 
+
 function deliveryKey(url, alertId, event) {
   return `${url}|${alertId}|${event}`;
 }
- 
-async function postWithRetry(url, payload, maxAttempts = 10) {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    let res;
-    try {
-      res = await axios.post(url, payload, {
-        timeout: 10000,
-        headers: { 'Content-Type': 'application/json' },
-        validateStatus: () => true,
-      });
-    } catch (err) {
-      // Network-level failure (DNS, refused, etc.) — NOT a transient 5xx, do not retry.
-      console.warn(`[Notify] Network error to ${url}: ${err.message} — not retrying`);
-      return { success: false, status: 0, networkError: true };
-    }
- 
-    if (res.status >= 200 && res.status < 300) {
-      return { success: true, status: res.status };
-    }
- 
-    if ([500, 502, 503, 504].includes(res.status)) {
-      const delay = Math.min(1000 * Math.pow(2, attempt), 16000);
-      console.warn(`[Notify] ${url} returned ${res.status}, retry ${attempt + 1}/${maxAttempts} in ${delay}ms`);
-      await sleep(delay);
-      continue;
-    }
- 
-    // Non-retryable (4xx, 3xx, etc.)
-    console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
-    return { success: false, status: res.status };
-  }
- 
-  console.error(`[Notify] ${url} exhausted ${maxAttempts} retries`);
-  return { success: false, status: 0 };
-}
- 
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
- 
+
+async function postOnce(url, payload) {
+  try {
+    const res = await axios.post(url, payload, {
+      timeout: 10_000,
+      headers: { 'Content-Type': 'application/json' },
+      validateStatus: () => true,
+    });
+    return { networkError: false, res };
+  } catch (err) {
+    return { networkError: true, err };
+  }
+}
+
+/**
+ * POST until 2xx, or retries exhausted by deadline.
+ * Adds `dedupeKey` to `delivered` only after a confirmed 2xx.
+ */
+async function deliverUntilSuccess(url, dedupeKey, payload, onDelivered) {
+  if (delivered.has(dedupeKey)) return;
+
+  const deadline = Date.now() + WEBHOOK_DELIVERY_DEADLINE_MS;
+  let attempt = 0;
+  let networkFailures = 0;
+
+  while (Date.now() < deadline && !delivered.has(dedupeKey)) {
+    const { networkError, res } = await postOnce(url, payload);
+
+    if (networkError) {
+      networkFailures++;
+      // Spec retries are for 5xx; avoid spending the full 60s budget on dead DNS/hostnames
+      if (networkFailures > 12) {
+        console.warn(`[Notify] giving up on network errors for ${url}`);
+        return;
+      }
+      await sleep(Math.min(200 + attempt * 100, 1500));
+      attempt++;
+      continue;
+    }
+
+    if (res.status >= 200 && res.status < 300) {
+      delivered.add(dedupeKey);
+      onDelivered();
+      console.log(`[Notify] ✓ → ${url}`);
+      return;
+    }
+
+    if ([500, 502, 503, 504].includes(res.status)) {
+      const delay = Math.min(150 * Math.pow(2, Math.min(attempt, 10)), 4000);
+      console.warn(`[Notify] ${url} returned ${res.status}, retry before deadline (${delay}ms)`);
+      await sleep(delay);
+      attempt++;
+      continue;
+    }
+
+    console.warn(`[Notify] ${url} returned non-retryable ${res.status}`);
+    return;
+  }
+
+  if (!delivered.has(dedupeKey)) {
+    console.error(`[Notify] ✗ delivery deadline exceeded for ${url}`);
+  }
+}
+
 function buildFiredPayload(alert) {
   return {
     event:            'alert.fired',
@@ -73,7 +104,7 @@ function buildFiredPayload(alert) {
     message:          alert.message,
   };
 }
- 
+
 function buildResolvedPayload(alert) {
   return {
     event:       'alert.resolved',
@@ -81,80 +112,45 @@ function buildResolvedPayload(alert) {
     resolved_at: alert.resolved_at,
   };
 }
- 
+
 async function deliverToReceiver(url, alertId, event, payload) {
   const key = deliveryKey(url, alertId, event);
- 
-  // Already successfully delivered — skip (exactly-once guarantee)
-  if (delivered.has(key)) {
-    console.log(`[Notify] Skip dup: ${key}`);
-    return;
-  }
- 
-  const result = await postWithRetry(url, payload);
- 
-  if (result.success) {
-    // Mark delivered ONLY after confirmed 2xx
-    delivered.add(key);
+
+  await deliverUntilSuccess(url, key, payload, () => {
     store.incrementWebhookDeliveries();
-    console.log(`[Notify] ✓ ${event} → ${url}`);
-  } else {
-    // Do NOT add to delivered — allow future retry on next alert cycle
-    if (!result.networkError) {
-      console.error(`[Notify] ✗ ${event} → ${url} (${result.status})`);
-    }
-  }
+  });
 }
- 
-async function dispatch(event, alert) {
-  const promises = [];
- 
-  // Standard webhooks
+
+function dispatch(event, alert) {
   for (const wh of store.getWebhooks()) {
     const payload = event === 'alert.fired'
       ? buildFiredPayload(alert)
       : buildResolvedPayload(alert);
- 
-    promises.push(deliverToReceiver(wh.url, alert.alert_id, event, payload));
+
+    void deliverToReceiver(wh.url, alert.alert_id, event, payload).catch((e) =>
+      console.error('[Notify] webhook receiver:', e));
   }
- 
-  // Slack / Discord integrations
+
   for (const intg of store.getIntegrations()) {
     if (!intg.events.includes(event)) continue;
- 
+
     const payload = intg.type === 'slack'
       ? buildSlackPayload(event, alert, intg)
       : intg.type === 'discord'
         ? buildDiscordPayload(event, alert, intg)
         : null;
- 
+
     if (!payload) continue;
- 
-    // Use a distinct key space for integrations vs raw webhooks
+
     const key = deliveryKey('intg:' + intg.webhook_url, alert.alert_id, event);
-    if (delivered.has(key)) {
-      console.log(`[Notify] Skip dup intg: ${key}`);
-      continue;
-    }
- 
-    promises.push(
-      postWithRetry(intg.webhook_url, payload).then((result) => {
-        if (result.success) {
-          delivered.add(key);
-          store.incrementWebhookDeliveries();
-          console.log(`[Notify] ✓ ${intg.type} ${event} → ${intg.webhook_url}`);
-        } else {
-          if (!result.networkError) {
-            console.error(`[Notify] ✗ ${intg.type} ${event} → ${intg.webhook_url} (${result.status})`);
-          }
-        }
-      })
-    );
+
+    void deliverUntilSuccess(intg.webhook_url, key, payload, () => {
+      store.incrementWebhookDeliveries();
+      console.log(`[Notify] ✓ ${intg.type} ${event} → ${intg.webhook_url}`);
+    }).catch((e) => console.error('[Notify] integration:', e));
   }
- 
-  await Promise.allSettled(promises);
 }
- 
+
 // Slack payload — required titles: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs, Fired At
 function buildSlackPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
@@ -178,7 +174,7 @@ function buildSlackPayload(event, alert, intg) {
     }],
   };
 }
- 
+
 // Discord payload — required names: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs
 function buildDiscordPayload(event, alert, intg) {
   const isFired = event === 'alert.fired';
@@ -201,7 +197,7 @@ function buildDiscordPayload(event, alert, intg) {
     }],
   };
 }
- 
+
 function reset() { delivered.clear(); }
- 
+
 module.exports = { dispatch, reset };

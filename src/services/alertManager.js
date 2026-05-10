@@ -10,7 +10,7 @@
  *   - After resolution a fresh breach mints a brand-new alert_id.
  *   - Active alert's failed_proxy_ids is updated every cycle so GET /alerts
  *     always agrees with GET /proxies (consistency requirement).
- *   - dispatch() is awaited so webhook delivery completes within the cycle.
+ *   - dispatch() runs asynchronously so webhook retries do not stall monitoring cycles.
  */
  
 const store = require('../store/dataStore');
@@ -45,7 +45,7 @@ async function evaluate(snapshot) {
       // No active alert — fire a new one.
       const alert = store.createAlert(failure_rate, total_proxies, failed_proxies, failed_proxy_ids);
       console.log(`[AlertManager] 🚨 FIRED ${alert.alert_id} | rate=${failure_rate.toFixed(4)} | down=${failed_proxies}/${total_proxies}`);
-      await notifications.dispatch('alert.fired', alert);
+      notifications.dispatch('alert.fired', alert);
     } else {
       // Active alert persists — update its live fields so all readers stay consistent.
       store.updateActiveAlert(failure_rate, total_proxies, failed_proxies, failed_proxy_ids);
@@ -56,7 +56,7 @@ async function evaluate(snapshot) {
     if (activeAlert) {
       const resolved = store.resolveAlert(activeAlert.alert_id);
       console.log(`[AlertManager] ✅ RESOLVED ${resolved.alert_id} | rate=${failure_rate.toFixed(4)}`);
-      await notifications.dispatch('alert.resolved', resolved);
+      notifications.dispatch('alert.resolved', resolved);
     }
   }
 }
